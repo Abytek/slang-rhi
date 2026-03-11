@@ -358,12 +358,16 @@ if(SLANG_RHI_ENABLE_D3D12 AND (CMAKE_SYSTEM_NAME STREQUAL "Windows"))
     message(STATUS "Fetching DirectXShaderCompiler ...")
     FetchPackage(dxc URL ${SLANG_RHI_DXC_URL})
     if(SLANG_RHI_ARCHITECTURE MATCHES "x86_64")
-        copy_file(${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll .)
-        copy_file(${dxc_SOURCE_DIR}/bin/x64/dxil.dll .)
+        # ABYTEK_SLANG
+        set(ABYTEK_SLANG_DXCOMPILER_DLL_FILE "${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll" CACHE STRING "Path to DXC binaries")
+        set(ABYTEK_SLANG_DXIL_DLL_FILE "${dxc_SOURCE_DIR}/bin/x64/dxil.dll" CACHE STRING "Path to DXIL binaries")
     elseif(SLANG_RHI_ARCHITECTURE MATCHES "aarch64|arm64")
-        copy_file(${dxc_SOURCE_DIR}/bin/arm64/dxcompiler.dll .)
-        copy_file(${dxc_SOURCE_DIR}/bin/arm64/dxil.dll .)
+        # ABYTEK_SLANG
+        set(ABYTEK_SLANG_DXCOMPILER_DLL_FILE "${dxc_SOURCE_DIR}/bin/arm64/dxcompiler.dll" CACHE STRING "Path to DXC binaries")
+        set(ABYTEK_SLANG_DXIL_DLL_FILE "${dxc_SOURCE_DIR}/bin/arm64/dxil.dll" CACHE STRING "Path to DXIL binaries")
     endif()
+    copy_file("${ABYTEK_SLANG_DXCOMPILER_DLL_FILE}" .)
+    copy_file("${ABYTEK_SLANG_DXIL_DLL_FILE}" .)
 endif()
 
 # Fetch & setup WinPixEventRuntime
