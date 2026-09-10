@@ -14,6 +14,7 @@
 
 namespace rhi::d3d12 {
 
+class BackendImpl;
 class AdapterImpl;
 class DeviceImpl;
 class BufferImpl;
@@ -29,6 +30,7 @@ class RenderPipelineImpl;
 class ComputePipelineImpl;
 class RayTracingPipelineImpl;
 class AccelerationStructureImpl;
+class MicromapImpl;
 class SamplerImpl;
 class ShaderObjectImpl;
 class RootShaderObjectImpl;

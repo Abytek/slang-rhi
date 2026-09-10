@@ -3,6 +3,8 @@
 #include "texture-test.h"
 #include "resource-desc-utils.h"
 
+#include <numeric>
+
 using namespace rhi;
 using namespace rhi::testing;
 
@@ -139,7 +141,9 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-rowalignment", D3D12 | Vulkan | Metal 
             // Get cpu side data.
             TextureData& data = c->getTextureData();
 
-            uint32_t customAlignment = 512;
+            Size requiredRowAlignment = 1;
+            REQUIRE_CALL(device->getTextureRowAlignment(data.desc.format, &requiredRowAlignment));
+            Size customAlignment = std::lcm<Size>(512, requiredRowAlignment);
 
             // Calculate total size needed for buffer
             // Note: need to ask texture its layout here, to get platform compatible strides
@@ -149,7 +153,7 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-rowalignment", D3D12 | Vulkan | Metal 
                 SubresourceLayout textureLayout;
                 REQUIRE_CALL(c->getTexture()->getSubresourceLayout(subresource.mip, &textureLayout));
 
-                textureLayout.rowPitch = math::calcAligned2(textureLayout.rowPitch, customAlignment);
+                textureLayout.rowPitch = math::calcAligned(textureLayout.rowPitch, customAlignment);
                 textureLayout.slicePitch = textureLayout.rowPitch * textureLayout.rowCount;
                 textureLayout.sizeInBytes = textureLayout.slicePitch * textureLayout.size.depth;
 
@@ -177,7 +181,7 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-rowalignment", D3D12 | Vulkan | Metal 
                     SubresourceLayout textureLayout;
                     REQUIRE_CALL(c->getTexture()->getSubresourceLayout(mip, &textureLayout));
 
-                    textureLayout.rowPitch = math::calcAligned2(textureLayout.rowPitch, customAlignment);
+                    textureLayout.rowPitch = math::calcAligned(textureLayout.rowPitch, customAlignment);
                     textureLayout.slicePitch = textureLayout.rowPitch * textureLayout.rowCount;
                     textureLayout.sizeInBytes = textureLayout.slicePitch * textureLayout.size.depth;
 
@@ -212,7 +216,7 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-rowalignment", D3D12 | Vulkan | Metal 
                     SubresourceLayout textureLayout;
                     REQUIRE_CALL(c->getTexture()->getSubresourceLayout(mip, &textureLayout));
 
-                    textureLayout.rowPitch = math::calcAligned2(textureLayout.rowPitch, customAlignment);
+                    textureLayout.rowPitch = math::calcAligned(textureLayout.rowPitch, customAlignment);
                     textureLayout.slicePitch = textureLayout.rowPitch * textureLayout.rowCount;
                     textureLayout.sizeInBytes = textureLayout.slicePitch * textureLayout.size.depth;
 
@@ -279,8 +283,8 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-offset", D3D12 | Vulkan | Metal | WGPU
             // Pick offset for the extra copy.
             Extent3D size = data.desc.size;
             Offset3D offset = {size.width / 4, size.height / 4, size.depth / 4};
-            offset.x = math::calcAligned2(offset.x, data.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, data.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, data.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, data.formatInfo.blockHeight);
 
             // Copy region of 2nd texture
             uint64_t bufferOffset = 0;
@@ -384,12 +388,12 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-sizeoffset", D3D12 | Vulkan | Metal | 
             // Pick offset for the extra copy.
             Extent3D size = data.desc.size;
             Offset3D offset = {size.width / 4, size.height / 4, size.depth / 4};
-            offset.x = math::calcAligned2(offset.x, data.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, data.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, data.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, data.formatInfo.blockHeight);
 
             Extent3D copySize = {max(size.width / 2, 1u), max(size.height / 2, 1u), max(size.depth / 2, 1u)};
-            copySize.width = math::calcAligned2(copySize.width, data.formatInfo.blockWidth);
-            copySize.height = math::calcAligned2(copySize.height, data.formatInfo.blockHeight);
+            copySize.width = math::calcAligned(copySize.width, data.formatInfo.blockWidth);
+            copySize.height = math::calcAligned(copySize.height, data.formatInfo.blockHeight);
 
             // Copy region of 2nd texture
             uint64_t bufferOffset = 0;
@@ -492,8 +496,8 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-offset-mip1", D3D12 | Vulkan | Metal |
             // Pick offset for the extra copy.
             Extent3D size = calcMipSize(data.desc.size, 1);
             Offset3D offset = {size.width / 4, size.height / 4, size.depth / 4};
-            offset.x = math::calcAligned2(offset.x, data.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, data.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, data.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, data.formatInfo.blockHeight);
 
             // Copy region of 2nd texture
             uint64_t bufferOffset = 0;
@@ -598,12 +602,12 @@ GPU_TEST_CASE("cmd-copy-texture-to-buffer-sizeoffset-mip1", D3D12 | Vulkan | Met
             // Pick offset for the extra copy.
             Extent3D size = calcMipSize(data.desc.size, 1);
             Offset3D offset = {size.width / 4, size.height / 4, size.depth / 4};
-            offset.x = math::calcAligned2(offset.x, data.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, data.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, data.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, data.formatInfo.blockHeight);
 
             Extent3D copySize = {max(size.width / 2, 1u), max(size.height / 2, 1u), max(size.depth / 2, 1u)};
-            copySize.width = math::calcAligned2(copySize.width, data.formatInfo.blockWidth);
-            copySize.height = math::calcAligned2(copySize.height, data.formatInfo.blockHeight);
+            copySize.width = math::calcAligned(copySize.width, data.formatInfo.blockWidth);
+            copySize.height = math::calcAligned(copySize.height, data.formatInfo.blockHeight);
 
             // Copy region of 2nd texture
             uint64_t bufferOffset = 0;

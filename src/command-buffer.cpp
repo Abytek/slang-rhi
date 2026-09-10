@@ -3,6 +3,7 @@
 #include "rhi-shared.h"
 #include "device.h"
 #include "format-conversion.h"
+#include "pipeline-resolver.h"
 
 namespace rhi {
 
@@ -174,7 +175,7 @@ void RenderPassEncoder::writeTimestamp(IQueryPool* queryPool, uint32_t queryInde
     if (m_commandList)
     {
         commands::WriteTimestamp cmd;
-        cmd.queryPool = checked_cast<QueryPool*>(queryPool);
+        cmd.queryPool = queryPool;
         cmd.queryIndex = queryIndex;
         m_commandList->write(std::move(cmd));
     }
@@ -302,7 +303,7 @@ void ComputePassEncoder::writeTimestamp(IQueryPool* queryPool, uint32_t queryInd
     if (m_commandList)
     {
         commands::WriteTimestamp cmd;
-        cmd.queryPool = checked_cast<QueryPool*>(queryPool);
+        cmd.queryPool = queryPool;
         cmd.queryIndex = queryIndex;
         m_commandList->write(std::move(cmd));
     }
@@ -428,7 +429,7 @@ void RayTracingPassEncoder::writeTimestamp(IQueryPool* queryPool, uint32_t query
     if (m_commandList)
     {
         commands::WriteTimestamp cmd;
-        cmd.queryPool = checked_cast<QueryPool*>(queryPool);
+        cmd.queryPool = queryPool;
         cmd.queryIndex = queryIndex;
         m_commandList->write(std::move(cmd));
     }
@@ -590,6 +591,10 @@ Result CommandEncoder::uploadTextureData(
     // Get texture
     Texture* textureImpl = checked_cast<Texture*>(dst);
 
+    // Get the buffer offset alignment required for every staged subresource.
+    Size offsetAlignment;
+    SLANG_RETURN_ON_FAIL(getDevice()->getTextureBufferOffsetAlignment(textureImpl->m_desc.format, &offsetAlignment));
+
     // Gather subresource layout for each layer/mip and sum up total required staging buffer size.
     Size totalSize = 0;
     {
@@ -601,6 +606,7 @@ Result CommandEncoder::uploadTextureData(
                 uint32_t mip = subresourceRange.mip + mipOffset;
 
                 textureImpl->getSubresourceRegionLayout(mip, offset, extent, kDefaultAlignment, srLayout);
+                srLayout->sizeInBytes = math::calcAligned(srLayout->sizeInBytes, offsetAlignment);
                 totalSize += srLayout->sizeInBytes;
                 srLayout++;
             }
@@ -609,7 +615,7 @@ Result CommandEncoder::uploadTextureData(
 
     // Allocate and retain a staging buffer for the upload.
     RefPtr<StagingHeap::Handle> handle;
-    SLANG_RETURN_ON_FAIL(getDevice()->m_uploadHeap.allocHandle(totalSize, {}, handle.writeRef()));
+    SLANG_RETURN_ON_FAIL(getDevice()->m_uploadHeap.allocHandle(totalSize, offsetAlignment, {}, handle.writeRef()));
     m_commandList->retainResource(handle);
 
     // Copy subresources a row at a time into the staging buffer.
@@ -679,7 +685,8 @@ Result CommandEncoder::uploadTextureData(
 Result CommandEncoder::uploadBufferData(IBuffer* dst, Offset offset, Size size, const void* data)
 {
     RefPtr<StagingHeap::Handle> handle;
-    SLANG_RETURN_ON_FAIL(getDevice()->m_uploadHeap.stageHandle(data, size, {}, handle.writeRef()));
+    // Buffer copy offsets must be aligned to four bytes.
+    SLANG_RETURN_ON_FAIL(getDevice()->m_uploadHeap.stageHandle(data, size, 4, {}, handle.writeRef()));
 
     m_commandList->retainResource(handle);
 
@@ -801,6 +808,15 @@ void CommandEncoder::buildAccelerationStructure(
     m_commandList->write(std::move(cmd));
 }
 
+void CommandEncoder::buildMicromap(const MicromapBuildDesc& desc, IMicromap* dst, BufferOffsetPair scratchBuffer)
+{
+    commands::BuildMicromap cmd;
+    cmd.desc = desc;
+    cmd.dst = dst;
+    cmd.scratchBuffer = scratchBuffer;
+    m_commandList->write(std::move(cmd));
+}
+
 void CommandEncoder::copyAccelerationStructure(
     IAccelerationStructure* dst,
     IAccelerationStructure* src,
@@ -822,22 +838,6 @@ void CommandEncoder::queryAccelerationStructureProperties(
 )
 {
     SLANG_RHI_UNIMPLEMENTED("queryAccelerationStructureProperties");
-}
-
-void CommandEncoder::serializeAccelerationStructure(BufferOffsetPair dst, IAccelerationStructure* src)
-{
-    commands::SerializeAccelerationStructure cmd;
-    cmd.dst = dst;
-    cmd.src = checked_cast<AccelerationStructure*>(src);
-    m_commandList->write(std::move(cmd));
-}
-
-void CommandEncoder::deserializeAccelerationStructure(IAccelerationStructure* dst, BufferOffsetPair src)
-{
-    commands::DeserializeAccelerationStructure cmd;
-    cmd.dst = checked_cast<AccelerationStructure*>(dst);
-    cmd.src = src;
-    m_commandList->write(std::move(cmd));
 }
 
 void CommandEncoder::executeClusterOperation(const ClusterOperationDesc& desc)
@@ -913,12 +913,19 @@ void CommandEncoder::insertDebugMarker(const char* name, const MarkerColor& colo
 void CommandEncoder::writeTimestamp(IQueryPool* queryPool, uint32_t queryIndex)
 {
     commands::WriteTimestamp cmd;
-    cmd.queryPool = checked_cast<QueryPool*>(queryPool);
+    cmd.queryPool = queryPool;
     cmd.queryIndex = queryIndex;
     m_commandList->write(std::move(cmd));
 }
 
-Result CommandEncoder::finish(ICommandBuffer** outCommandBuffer)
+void CommandEncoder::executeCallback(const ExecuteCallbackDesc& desc)
+{
+    commands::ExecuteCallback cmd;
+    cmd.desc = desc;
+    m_commandList->write(std::move(cmd));
+}
+
+Result CommandEncoder::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
 {
     // iterate over commands and specialize pipelines
     return SLANG_FAIL;
@@ -947,43 +954,7 @@ Result CommandEncoder::getPipelineSpecializationArgs(
 
 Result CommandEncoder::resolvePipelines(Device* device)
 {
-    CommandList* commandList = m_commandList;
-    auto command = commandList->getCommands();
-    while (command)
-    {
-        if (command->id == CommandID::SetRenderState)
-        {
-            auto& cmd = commandList->getCommand<commands::SetRenderState>(command);
-            RenderPipeline* pipeline = checked_cast<RenderPipeline*>(cmd.pipeline);
-            auto specializationArgs = static_cast<ExtendedShaderObjectTypeListObject*>(cmd.specializationArgs);
-            Pipeline* concretePipeline = nullptr;
-            SLANG_RETURN_ON_FAIL(device->getConcretePipeline(pipeline, specializationArgs, concretePipeline));
-            cmd.pipeline = static_cast<RenderPipeline*>(concretePipeline);
-            cmd.specializationArgs = nullptr;
-        }
-        else if (command->id == CommandID::SetComputeState)
-        {
-            auto& cmd = commandList->getCommand<commands::SetComputeState>(command);
-            ComputePipeline* pipeline = checked_cast<ComputePipeline*>(cmd.pipeline);
-            auto specializationArgs = static_cast<ExtendedShaderObjectTypeListObject*>(cmd.specializationArgs);
-            Pipeline* concretePipeline = nullptr;
-            SLANG_RETURN_ON_FAIL(device->getConcretePipeline(pipeline, specializationArgs, concretePipeline));
-            cmd.pipeline = static_cast<ComputePipeline*>(concretePipeline);
-            cmd.specializationArgs = nullptr;
-        }
-        else if (command->id == CommandID::SetRayTracingState)
-        {
-            auto& cmd = commandList->getCommand<commands::SetRayTracingState>(command);
-            RayTracingPipeline* pipeline = checked_cast<RayTracingPipeline*>(cmd.pipeline);
-            auto specializationArgs = static_cast<ExtendedShaderObjectTypeListObject*>(cmd.specializationArgs);
-            Pipeline* concretePipeline = nullptr;
-            SLANG_RETURN_ON_FAIL(device->getConcretePipeline(pipeline, specializationArgs, concretePipeline));
-            cmd.pipeline = static_cast<RayTracingPipeline*>(concretePipeline);
-            cmd.specializationArgs = nullptr;
-        }
-        command = command->next;
-    }
-    return SLANG_OK;
+    return rhi::resolvePipelines(device, m_commandList);
 }
 
 // ----------------------------------------------------------------------------
@@ -995,6 +966,32 @@ ICommandBuffer* CommandBuffer::getInterface(const Guid& guid)
     if (guid == ISlangUnknown::getTypeGuid() || guid == ICommandBuffer::getTypeGuid())
         return static_cast<ICommandBuffer*>(this);
     return nullptr;
+}
+
+CommandBuffer::~CommandBuffer()
+{
+    resetCallbackObjects();
+}
+
+Result CommandBuffer::reset()
+{
+    m_commandList.reset();
+    resetCallbackObjects();
+    m_allocator.reset();
+    m_trackedObjects.clear();
+    return SLANG_OK;
+}
+
+void CommandBuffer::resetCallbackObjects()
+{
+    for (const ExecuteCallbackObjectRetainer& object : m_trackedExecuteCallbackObjects)
+    {
+        if (object.userObject && object.releaseUserObject)
+        {
+            object.releaseUserObject(object.userObject);
+        }
+    }
+    m_trackedExecuteCallbackObjects.clear();
 }
 
 } // namespace rhi

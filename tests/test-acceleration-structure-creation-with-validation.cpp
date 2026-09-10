@@ -7,6 +7,11 @@ using namespace rhi::testing;
 static DebugLayerOptions kDebugLayerOptions = DebugLayerOptionsBuilder().enableGPUAssistedValidation();
 GPU_TEST_CASE_EX("acceleration-structure-creation-with-validation", Vulkan, kDebugLayerOptions)
 {
+    if (!device->hasFeature(Feature::AccelerationStructure))
+    {
+        SKIP("Acceleration structures not supported");
+    }
+
     // Ensure that GPU-AV does not assert when using an acceleration-structure
     DeviceExtraOptions deviceExtraOptions{};
     device = createTestingDevice(ctx, ctx->deviceType, false, &deviceExtraOptions);
@@ -72,6 +77,7 @@ GPU_TEST_CASE_EX("acceleration-structure-creation-with-validation", Vulkan, kDeb
         // Build acceleration structure.
         ComPtr<IAccelerationStructure> draftAS;
         AccelerationStructureDesc draftDesc = {};
+        draftDesc.kind = AccelerationStructureKind::BottomLevel;
         draftDesc.size = accelerationStructureSizes.accelerationStructureSize;
         m_device->createAccelerationStructure(draftDesc, draftAS.writeRef());
 
@@ -88,6 +94,7 @@ GPU_TEST_CASE_EX("acceleration-structure-creation-with-validation", Vulkan, kDeb
         uint64_t compactedSize = 0;
         compactedSizeQuery->getResult(0, 1, &compactedSize);
         AccelerationStructureDesc finalDesc;
+        finalDesc.kind = AccelerationStructureKind::BottomLevel;
         finalDesc.size = compactedSize;
         m_device->createAccelerationStructure(finalDesc, m_bottomLevelAccelerationStructure.writeRef());
 
@@ -155,6 +162,7 @@ GPU_TEST_CASE_EX("acceleration-structure-creation-with-validation", Vulkan, kDeb
         ComPtr<IBuffer> scratchBuffer = m_device->createBuffer(scratchBufferDesc);
 
         AccelerationStructureDesc createDesc = {};
+        createDesc.kind = AccelerationStructureKind::TopLevel;
         createDesc.size = accelerationStructureSizes.accelerationStructureSize;
         m_device->createAccelerationStructure(createDesc, m_topLevelAccelerationStructure.writeRef());
 

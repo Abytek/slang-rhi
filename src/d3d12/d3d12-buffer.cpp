@@ -47,11 +47,6 @@ void BufferImpl::deleteThis()
     getDevice<DeviceImpl>()->deferDelete(this);
 }
 
-DeviceAddress BufferImpl::getDeviceAddress()
-{
-    return (DeviceAddress)m_resource.getResource()->GetGPUVirtualAddress();
-}
-
 Result BufferImpl::getNativeHandle(NativeHandle* outHandle)
 {
     outHandle->type = NativeHandleType::D3D12Resource;
@@ -71,17 +66,27 @@ Result BufferImpl::getSharedHandle(NativeHandle* outHandle)
         return SLANG_OK;
     }
 
+    DeviceImpl* device = getDevice<DeviceImpl>();
+
     // If a shared handle doesn't exist, create one and store it.
-    ComPtr<ID3D12Device> pDevice;
-    auto pResource = m_resource.getResource();
-    pResource->GetDevice(IID_PPV_ARGS(pDevice.writeRef()));
-    SLANG_RETURN_ON_FAIL(
-        pDevice->CreateSharedHandle(pResource, NULL, GENERIC_ALL, nullptr, (HANDLE*)&m_sharedHandle.value)
-    );
-    m_sharedHandle.type = NativeHandleType::Win32;
+    if (!m_sharedHandle)
+    {
+        HANDLE handle = NULL;
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(
+            device->m_device->CreateSharedHandle(m_resource.getResource(), NULL, GENERIC_ALL, nullptr, &handle),
+            device
+        );
+        m_sharedHandle = {NativeHandleType::Win32, (uint64_t)handle};
+    }
+
     *outHandle = m_sharedHandle;
     return SLANG_OK;
 #endif
+}
+
+DeviceAddress BufferImpl::getDeviceAddress()
+{
+    return (DeviceAddress)m_resource.getResource()->GetGPUVirtualAddress();
 }
 
 Result BufferImpl::getDescriptorHandle(
@@ -108,9 +113,11 @@ Result BufferImpl::getDescriptorHandle(
         return SLANG_OK;
     }
 
-    SLANG_RETURN_FALSE_ON_FAIL(
-        device->m_bindlessDescriptorSet->allocBufferHandle(this, access, format, range, &handle)
-    );
+    if (!handle)
+    {
+        SLANG_RETURN_ON_FAIL(device->m_bindlessDescriptorSet->allocBufferHandle(this, access, format, range, &handle));
+    }
+
     *outHandle = handle;
     return SLANG_OK;
 }
@@ -204,7 +211,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE BufferImpl::getUAV(
 Result DeviceImpl::mapBuffer(IBuffer* buffer, CpuAccessMode mode, void** outData)
 {
     BufferImpl* bufferImpl = checked_cast<BufferImpl*>(buffer);
-    SLANG_RETURN_ON_FAIL(bufferImpl->m_resource.getResource()->Map(0, nullptr, outData));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(bufferImpl->m_resource.getResource()->Map(0, nullptr, outData), this);
     return SLANG_OK;
 }
 

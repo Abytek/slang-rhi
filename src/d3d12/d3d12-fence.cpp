@@ -11,18 +11,29 @@ FenceImpl::FenceImpl(Device* device, const FenceDesc& desc)
 FenceImpl::~FenceImpl()
 {
     if (m_waitEvent)
+    {
         ::CloseHandle(m_waitEvent);
+    }
+    if (m_sharedHandle)
+    {
+#if SLANG_WINDOWS_FAMILY
+        ::CloseHandle((HANDLE)m_sharedHandle.value);
+#endif
+    }
 }
 
 Result FenceImpl::init()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
 
-    SLANG_RETURN_ON_FAIL(device->m_device->CreateFence(
-        m_desc.initialValue,
-        m_desc.isShared ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE,
-        IID_PPV_ARGS(m_fence.writeRef())
-    ));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        device->m_device->CreateFence(
+            m_desc.initialValue,
+            m_desc.isShared ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(m_fence.writeRef())
+        ),
+        device
+    );
     if (m_desc.label)
     {
         m_fence->SetName(string::to_wstring(m_desc.label).c_str());
@@ -46,7 +57,7 @@ Result FenceImpl::getCurrentValue(uint64_t* outValue)
 
 Result FenceImpl::setCurrentValue(uint64_t value)
 {
-    SLANG_RETURN_ON_FAIL(m_fence->Signal(value));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_fence->Signal(value), m_device);
     return SLANG_OK;
 }
 
@@ -62,20 +73,19 @@ Result FenceImpl::getSharedHandle(NativeHandle* outHandle)
 #if !SLANG_WINDOWS_FAMILY
     return SLANG_E_NOT_AVAILABLE;
 #else
-    // Check if a shared handle already exists.
-    if (sharedHandle)
+    DeviceImpl* device = getDevice<DeviceImpl>();
+
+    if (!m_sharedHandle)
     {
-        *outHandle = sharedHandle;
-        return SLANG_OK;
+        HANDLE handle = NULL;
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(
+            device->m_device->CreateSharedHandle(m_fence, NULL, GENERIC_ALL, nullptr, &handle),
+            device
+        );
+        m_sharedHandle = NativeHandle{NativeHandleType::Win32, (uint64_t)handle};
     }
 
-    ComPtr<ID3D12Device> devicePtr;
-    m_fence->GetDevice(IID_PPV_ARGS(devicePtr.writeRef()));
-    SLANG_RETURN_ON_FAIL(
-        devicePtr->CreateSharedHandle(m_fence, NULL, GENERIC_ALL, nullptr, (HANDLE*)&sharedHandle.value)
-    );
-    sharedHandle.type = NativeHandleType::Win32;
-    *outHandle = sharedHandle;
+    *outHandle = m_sharedHandle;
     return SLANG_OK;
 #endif
 }

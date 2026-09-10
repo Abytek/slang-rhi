@@ -3,8 +3,6 @@
 #include "d3d12-buffer.h"
 #include "d3d12-query.h"
 
-#include "core/string.h"
-
 namespace rhi::d3d12 {
 
 bool isSupportedNVAPIOp(ID3D12Device* dev, uint32_t op)
@@ -351,6 +349,11 @@ D3D12_RESOURCE_STATES translateResourceState(ResourceState state)
         return D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     case ResourceState::AccelerationStructureBuildInput:
         return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    case ResourceState::MicromapBuildInput:
+        return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    case ResourceState::MicromapRead:
+    case ResourceState::MicromapWrite:
+        return D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     }
     return D3D12_RESOURCE_STATE_COMMON;
 }
@@ -570,13 +573,6 @@ void translatePostBuildInfoDescs(
             postBuildInfoDescs[i].DestBuffer =
                 checked_cast<PlainBufferProxyQueryPoolImpl*>(queryDescs[i].queryPool)->m_buffer->getDeviceAddress() +
                 sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE_DESC) *
-                    queryDescs[i].firstQueryIndex;
-            break;
-        case QueryType::AccelerationStructureSerializedSize:
-            postBuildInfoDescs[i].InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION;
-            postBuildInfoDescs[i].DestBuffer =
-                checked_cast<PlainBufferProxyQueryPoolImpl*>(queryDescs[i].queryPool)->m_buffer->getDeviceAddress() +
-                sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION_DESC) *
                     queryDescs[i].firstQueryIndex;
             break;
         default:

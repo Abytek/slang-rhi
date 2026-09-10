@@ -20,8 +20,6 @@ ID3D11ShaderResourceView* BufferImpl::getSRV(Format format, const BufferRange& r
 
     ViewKey key = {format, range};
 
-    std::lock_guard<std::mutex> lock(m_mutex);
-
     ComPtr<ID3D11ShaderResourceView>& srv = m_srvs[key];
     if (srv)
         return srv.get();
@@ -64,8 +62,6 @@ ID3D11UnorderedAccessView* BufferImpl::getUAV(Format format, const BufferRange& 
     DeviceImpl* device = getDevice<DeviceImpl>();
 
     ViewKey key = {format, range};
-
-    std::lock_guard<std::mutex> lock(m_mutex);
 
     ComPtr<ID3D11UnorderedAccessView>& uav = m_uavs[key];
     if (uav)
@@ -188,8 +184,9 @@ Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, I
 
     RefPtr<BufferImpl> buffer(new BufferImpl(this, desc));
 
-    SLANG_RETURN_ON_FAIL(
-        m_device->CreateBuffer(&bufferDesc, initData ? &subresourceData : nullptr, buffer->m_buffer.writeRef())
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_device->CreateBuffer(&bufferDesc, initData ? &subresourceData : nullptr, buffer->m_buffer.writeRef()),
+        this
     );
     buffer->m_d3dUsage = bufferDesc.Usage;
 
@@ -216,7 +213,10 @@ Result DeviceImpl::mapBuffer(IBuffer* buffer, CpuAccessMode mode, void** outData
     }
 
     D3D11_MAPPED_SUBRESOURCE mappedResource;
-    SLANG_RETURN_ON_FAIL(m_immediateContext->Map(bufferImpl->m_buffer, 0, mapType, 0, &mappedResource));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_immediateContext->Map(bufferImpl->m_buffer, 0, mapType, 0, &mappedResource),
+        this
+    );
     *outData = mappedResource.pData;
     return SLANG_OK;
 }

@@ -11,6 +11,7 @@
 #include "reference.h"
 #include "command-list.h"
 #include "device-child.h"
+#include "transient-buffer-heap.h"
 
 #include "rhi-shared-fwd.h"
 
@@ -44,9 +45,15 @@ public:
 
     // ICommandQueue implementation
     virtual SLANG_NO_THROW QueueType SLANG_MCALL getType() override { return m_type; }
+    virtual SLANG_NO_THROW Result SLANG_MCALL getTimestampCalibration(TimestampCalibration* outCalibration) override
+    {
+        SLANG_UNUSED(outCalibration);
+        return SLANG_E_NOT_AVAILABLE;
+    }
 
 public:
     QueueType m_type;
+    TransientBufferHeap m_constantBufferHeap;
 };
 
 class RenderPassEncoder : public IRenderPassEncoder
@@ -189,6 +196,9 @@ public:
     ICommandEncoder* getInterface(const Guid& guid);
 
 public:
+    CommandEncoderDesc m_desc;
+    StructHolder m_descHolder;
+
     // Current command list to write to. Must be set by the derived class.
     CommandList* m_commandList = nullptr;
 
@@ -200,12 +210,14 @@ public:
     // This is populated during command encoding and later used when asynchronously resolving pipelines.
     std::vector<RefPtr<ExtendedShaderObjectTypeListObject>> m_pipelineSpecializationArgs;
 
-    CommandEncoder(Device* device)
+    CommandEncoder(Device* device, const CommandEncoderDesc& desc)
         : DeviceChild(device)
+        , m_desc(desc)
         , m_renderPassEncoder(this)
         , m_computePassEncoder(this)
         , m_rayTracingPassEncoder(this)
     {
+        m_descHolder.holdString(m_desc.label);
     }
 
     virtual Result getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData) = 0;
@@ -218,6 +230,8 @@ public:
     Result resolvePipelines(Device* device);
 
     // ICommandEncoder implementation
+    virtual SLANG_NO_THROW const CommandEncoderDesc& SLANG_MCALL getDesc() override { return m_desc; }
+
     virtual SLANG_NO_THROW IRenderPassEncoder* SLANG_MCALL beginRenderPass(const RenderPassDesc& desc) override;
     virtual SLANG_NO_THROW IComputePassEncoder* SLANG_MCALL beginComputePass() override;
     virtual SLANG_NO_THROW IRayTracingPassEncoder* SLANG_MCALL beginRayTracingPass() override;
@@ -327,6 +341,12 @@ public:
         const AccelerationStructureQueryDesc* queryDescs
     ) override;
 
+    virtual SLANG_NO_THROW void SLANG_MCALL buildMicromap(
+        const MicromapBuildDesc& desc,
+        IMicromap* dst,
+        BufferOffsetPair scratchBuffer
+    ) override;
+
     virtual SLANG_NO_THROW void SLANG_MCALL copyAccelerationStructure(
         IAccelerationStructure* dst,
         IAccelerationStructure* src,
@@ -338,16 +358,6 @@ public:
         IAccelerationStructure** accelerationStructures,
         uint32_t queryCount,
         const AccelerationStructureQueryDesc* queryDescs
-    ) override;
-
-    virtual SLANG_NO_THROW void SLANG_MCALL serializeAccelerationStructure(
-        BufferOffsetPair dst,
-        IAccelerationStructure* src
-    ) override;
-
-    virtual SLANG_NO_THROW void SLANG_MCALL deserializeAccelerationStructure(
-        IAccelerationStructure* dst,
-        BufferOffsetPair src
     ) override;
 
     virtual SLANG_NO_THROW void SLANG_MCALL executeClusterOperation(const ClusterOperationDesc& desc) override;
@@ -376,7 +386,12 @@ public:
 
     virtual SLANG_NO_THROW void SLANG_MCALL writeTimestamp(IQueryPool* queryPool, uint32_t queryIndex) override;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL finish(ICommandBuffer** outCommandBuffer) override;
+    virtual SLANG_NO_THROW void SLANG_MCALL executeCallback(const ExecuteCallbackDesc& desc) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL finish(
+        const CommandBufferDesc& desc,
+        ICommandBuffer** outCommandBuffer
+    ) override;
 };
 
 class CommandBuffer : public ICommandBuffer, public DeviceChild
@@ -388,25 +403,36 @@ public:
 public:
     CommandBuffer(Device* device)
         : DeviceChild(device)
-        , m_commandList(m_allocator, m_trackedObjects)
+        , m_commandList(m_allocator, m_trackedObjects, m_trackedExecuteCallbackObjects)
     {
     }
-    virtual ~CommandBuffer() = default;
+    virtual ~CommandBuffer();
 
     virtual void makeExternal() override { establishStrongReferenceToDevice(); }
     virtual void makeInternal() override { breakStrongReferenceToDevice(); }
 
-    virtual Result reset()
+    virtual Result reset();
+
+    void setDesc(const CommandBufferDesc& desc)
     {
-        m_commandList.reset();
-        m_allocator.reset();
-        m_trackedObjects.clear();
-        return SLANG_OK;
+        m_desc = desc;
+        m_descHolder.reset();
+        m_descHolder.holdString(m_desc.label);
     }
 
+    // ICommandBuffer implementation
+    virtual SLANG_NO_THROW const CommandBufferDesc& SLANG_MCALL getDesc() override { return m_desc; }
+
+public:
+    CommandBufferDesc m_desc;
+    StructHolder m_descHolder;
     ArenaAllocator m_allocator;
-    CommandList m_commandList;
     std::set<RefPtr<RefObject>> m_trackedObjects;
+    std::vector<ExecuteCallbackObjectRetainer> m_trackedExecuteCallbackObjects;
+    CommandList m_commandList;
+
+private:
+    void resetCallbackObjects();
 };
 
 } // namespace rhi

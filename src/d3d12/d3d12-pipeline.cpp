@@ -9,12 +9,22 @@
 #include "core/stable_vector.h"
 #include "core/string.h"
 #include "core/sha1.h"
+#include "core/deferred.h"
 
 #include <climits>
 
 #include <string>
 
 namespace rhi::d3d12 {
+
+#if SLANG_RHI_ENABLE_NVAPI
+// NvAPI_D3D12_SetCreatePipelineStateOptions affects subsequent pipeline creations for
+// a native device. Use a process-wide lock because multiple RHI devices can wrap the
+// same ID3D12Device5.
+SLANG_RHI_STATIC_MUTEX_BEGIN
+static std::mutex s_nvapiRayTracingPipelineCreationMutex;
+SLANG_RHI_STATIC_MUTEX_END
+#endif
 
 void hashShader(SHA1& sha1, const D3D12_SHADER_BYTECODE& shaderBytecode)
 {
@@ -132,11 +142,13 @@ Result createPipelineWithCache(
     Result (*createPipelineFunc)(DeviceImpl* device, PipelineDesc* desc, PipelineState** outPipeline),
     PipelineState** outPipeline,
     bool& outCached,
-    size_t& outCacheSize
+    size_t& outCacheSize,
+    ComPtr<ISlangBlob>& outCacheKey
 )
 {
     outCached = false;
     outCacheSize = 0;
+    outCacheKey = nullptr;
 
     // Early out if cache is not enabled.
     if (!device->m_persistentPipelineCache)
@@ -168,6 +180,7 @@ Result createPipelineWithCache(
             writeCache = false;
             outCached = true;
             outCacheSize = pipelineCacheData->getBufferSize();
+            outCacheKey = pipelineCacheKey;
         }
         else
         {
@@ -192,6 +205,7 @@ Result createPipelineWithCache(
             pipelineCacheData = UnownedBlob::create(cachedBlob->GetBufferPointer(), cachedBlob->GetBufferSize());
             device->m_persistentPipelineCache->writeCache(pipelineCacheKey, pipelineCacheData);
             outCacheSize = pipelineCacheData->getBufferSize();
+            outCacheKey = pipelineCacheKey;
         }
     }
 
@@ -221,6 +235,7 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     InputLayoutImpl* inputLayout = checked_cast<InputLayoutImpl*>(desc.inputLayout);
 
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ISlangBlob> cacheKey;
     bool cached = false;
     size_t cacheSize = 0;
 
@@ -354,7 +369,10 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
         fillCommonGraphicsState(meshDesc);
         CD3DX12_PIPELINE_STATE_STREAM2 meshStateStream{meshDesc};
         D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(meshStateStream), &meshStateStream};
-        SLANG_RETURN_ON_FAIL(m_device5->CreatePipelineState(&streamDesc, IID_PPV_ARGS(pipelineState.writeRef())));
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(
+            m_device5->CreatePipelineState(&streamDesc, IID_PPV_ARGS(pipelineState.writeRef())),
+            this
+        );
     }
     else
     {
@@ -428,7 +446,8 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
             },
             pipelineState.writeRef(),
             cached,
-            cacheSize
+            cacheSize,
+            cacheKey
         );
         SLANG_RETURN_ON_FAIL(result);
     }
@@ -447,7 +466,8 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
             startTime,
             Timer::now(),
             cached,
-            cacheSize
+            cacheSize,
+            cacheKey
         );
     }
 
@@ -488,6 +508,7 @@ Result DeviceImpl::createComputePipeline2(const ComputePipelineDesc& desc, IComp
     computeDesc.CS = {program->m_shaders[0].code.data(), SIZE_T(program->m_shaders[0].code.size())};
 
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ISlangBlob> cacheKey;
     bool cached = false;
     size_t cacheSize = 0;
     Result result = createPipelineWithCache<D3D12_COMPUTE_PIPELINE_STATE_DESC, ID3D12PipelineState>(
@@ -525,7 +546,8 @@ Result DeviceImpl::createComputePipeline2(const ComputePipelineDesc& desc, IComp
         },
         pipelineState.writeRef(),
         cached,
-        cacheSize
+        cacheSize,
+        cacheKey
     );
     SLANG_RETURN_ON_FAIL(result);
 
@@ -543,7 +565,8 @@ Result DeviceImpl::createComputePipeline2(const ComputePipelineDesc& desc, IComp
             startTime,
             Timer::now(),
             cached,
-            cacheSize
+            cacheSize,
+            cacheKey
         );
     }
 
@@ -600,6 +623,8 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
         pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
     if (is_set(desc.flags, RayTracingPipelineFlags::SkipProcedurals))
         pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+    if (is_set(desc.flags, RayTracingPipelineFlags::EnableOpacityMicromaps))
+        pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS;
 
     D3D12_STATE_SUBOBJECT pipelineConfigSubobject = {};
     pipelineConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1;
@@ -613,7 +638,7 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
         library.DXILLibrary.pShaderBytecode = shader.code.data();
         library.NumExports = 1;
         D3D12_EXPORT_DESC exportDesc = {};
-        exportDesc.Name = getWStr(shader.entryPointInfo->getNameOverride());
+        exportDesc.Name = getWStr(shader.entryPointName.c_str());
         exportDesc.ExportToRename = nullptr;
         exportDesc.Flags = D3D12_EXPORT_FLAG_NONE;
         exports.push_back(exportDesc);
@@ -671,62 +696,112 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
     globalSignatureSubobject.pDesc = &globalSignatureDesc;
     subObjects.push_back(globalSignatureSubobject);
 
-#if SLANG_RHI_ENABLE_NVAPI
-    bool nvapiResetPipelineStateOptions = false;
-    if (m_nvapiShaderExtension)
-    {
-        SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(
-            m_device,
-            m_nvapiShaderExtension.uavSlot,
-            m_nvapiShaderExtension.registerSpace
-        ));
-
-        if (is_set(desc.flags, RayTracingPipelineFlags::EnableLinearSweptSpheres) ||
-            is_set(desc.flags, RayTracingPipelineFlags::EnableSpheres) ||
-            is_set(desc.flags, RayTracingPipelineFlags::EnableClusters))
-        {
-            NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS params = {};
-            params.version = NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER;
-
-            if (is_set(desc.flags, RayTracingPipelineFlags::EnableLinearSweptSpheres))
-                params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_LSS_SUPPORT;
-            if (is_set(desc.flags, RayTracingPipelineFlags::EnableSpheres))
-                params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_SPHERE_SUPPORT;
-            if (is_set(desc.flags, RayTracingPipelineFlags::EnableClusters))
-                params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_CLUSTER_SUPPORT;
-
-            // TODO: This sets global state!
-            // Need to revisit if createRayTracingPipeline2 can get called from multiple threads.
-            SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetCreatePipelineStateOptions(m_device5, &params));
-            nvapiResetPipelineStateOptions = true;
-        }
-    }
-#endif // SLANG_RHI_ENABLE_NVAPI
-
     D3D12_STATE_OBJECT_DESC rtpsoDesc = {};
     rtpsoDesc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     rtpsoDesc.NumSubobjects = (UINT)subObjects.size();
     rtpsoDesc.pSubobjects = subObjects.data();
-    SLANG_RETURN_ON_FAIL(m_device5->CreateStateObject(&rtpsoDesc, IID_PPV_ARGS(stateObject.writeRef())));
+
+    auto createStateObject = [&]() -> Result
+    {
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(
+            m_device5->CreateStateObject(&rtpsoDesc, IID_PPV_ARGS(stateObject.writeRef())),
+            this
+        );
+        return SLANG_OK;
+    };
 
 #if SLANG_RHI_ENABLE_NVAPI
-    if (m_nvapiShaderExtension)
     {
-        SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(m_device, 0xffffffff, 0));
+        std::lock_guard<std::mutex> lock(s_nvapiRayTracingPipelineCreationMutex);
+        bool resetShaderExtensionSlot = false;
+        bool resetPipelineStateOptions = false;
+        SLANG_RHI_DEFERRED({
+            if (resetPipelineStateOptions)
+            {
+                NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS params = {};
+                params.version = NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER;
+                SLANG_RHI_NVAPI_CHECK(NvAPI_D3D12_SetCreatePipelineStateOptions(m_device5, &params));
+            }
+            if (resetShaderExtensionSlot)
+            {
+                SLANG_RHI_NVAPI_CHECK(NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(m_device, 0xffffffff, 0));
+            }
+        });
 
-        if (nvapiResetPipelineStateOptions)
+        if (m_nvapiShaderExtension)
         {
-            NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS params = {};
-            params.version = NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER;
+            resetShaderExtensionSlot = true;
+            SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread(
+                m_device,
+                m_nvapiShaderExtension.uavSlot,
+                m_nvapiShaderExtension.registerSpace
+            ));
 
-            SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetCreatePipelineStateOptions(m_device5, &params));
+            if (is_set(desc.flags, RayTracingPipelineFlags::EnableLinearSweptSpheres) ||
+                is_set(desc.flags, RayTracingPipelineFlags::EnableSpheres) ||
+                is_set(desc.flags, RayTracingPipelineFlags::EnableClusters))
+            {
+                NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS params = {};
+                params.version = NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER;
+
+                if (is_set(desc.flags, RayTracingPipelineFlags::EnableLinearSweptSpheres))
+                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_LSS_SUPPORT;
+                if (is_set(desc.flags, RayTracingPipelineFlags::EnableSpheres))
+                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_SPHERE_SUPPORT;
+                if (is_set(desc.flags, RayTracingPipelineFlags::EnableClusters))
+                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_CLUSTER_SUPPORT;
+
+                resetPipelineStateOptions = true;
+                SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetCreatePipelineStateOptions(m_device5, &params));
+            }
         }
+
+        SLANG_RETURN_ON_FAIL(createStateObject());
+    }
+#else
+    {
+        SLANG_RETURN_ON_FAIL(createStateObject());
     }
 #endif // SLANG_RHI_ENABLE_NVAPI
 
     if (desc.label)
     {
         stateObject->SetName(string::to_wstring(desc.label).c_str());
+    }
+
+    // Query shader identifiers and cache them for later use in shader binding tables.
+    // Only ray generation, miss, and callable shaders and hit groups have shader identifiers.
+    std::map<std::string, void*> shaderIdentifierByName;
+    {
+        ComPtr<ID3D12StateObjectProperties> stateObjectProperties;
+        stateObject->QueryInterface(stateObjectProperties.writeRef());
+        if (stateObjectProperties)
+        {
+            for (const ShaderBinary& shader : program->m_shaders)
+            {
+                if (shader.stage != SLANG_STAGE_RAY_GENERATION && shader.stage != SLANG_STAGE_MISS &&
+                    shader.stage != SLANG_STAGE_CALLABLE)
+                    continue;
+                std::string name = shader.entryPointName;
+                void* id = stateObjectProperties->GetShaderIdentifier(string::to_wstring(name).data());
+                if (id)
+                {
+                    shaderIdentifierByName[name] = id;
+                }
+            }
+            for (uint32_t i = 0; i < desc.hitGroupCount; i++)
+            {
+                if (desc.hitGroups[i].hitGroupName)
+                {
+                    std::string name = desc.hitGroups[i].hitGroupName;
+                    void* id = stateObjectProperties->GetShaderIdentifier(string::to_wstring(name).data());
+                    if (id)
+                    {
+                        shaderIdentifierByName[name] = id;
+                    }
+                }
+            }
+        }
     }
 
     // Report the pipeline creation time.
@@ -738,7 +813,8 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
             startTime,
             Timer::now(),
             false,
-            0
+            0,
+            nullptr
         );
     }
 
@@ -746,6 +822,7 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
     pipeline->m_program = program;
     pipeline->m_rootObjectLayout = program->m_rootObjectLayout;
     pipeline->m_stateObject = stateObject;
+    pipeline->m_shaderIdentifierByName = std::move(shaderIdentifierByName);
     returnComPtr(outPipeline, pipeline);
     return SLANG_OK;
 }

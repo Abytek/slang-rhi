@@ -137,6 +137,10 @@ const char* enumToString(BufferUsage value)
         return S_BufferUsage_AccelerationStructure;
     case BufferUsage::AccelerationStructureBuildInput:
         return S_BufferUsage_AccelerationStructureBuildInput;
+    case BufferUsage::MicromapBuildInput:
+        return S_BufferUsage_MicromapBuildInput;
+    case BufferUsage::MicromapStorage:
+        return S_BufferUsage_MicromapStorage;
     case BufferUsage::ShaderTable:
         return S_BufferUsage_ShaderTable;
     case BufferUsage::Shared:
@@ -271,6 +275,12 @@ const char* enumToString(ResourceState value)
         return S_ResourceState_AccelerationStructureWrite;
     case ResourceState::AccelerationStructureBuildInput:
         return S_ResourceState_AccelerationStructureBuildInput;
+    case ResourceState::MicromapBuildInput:
+        return S_ResourceState_MicromapBuildInput;
+    case ResourceState::MicromapRead:
+        return S_ResourceState_MicromapRead;
+    case ResourceState::MicromapWrite:
+        return S_ResourceState_MicromapWrite;
     }
     return S_INVALID;
 }
@@ -377,6 +387,20 @@ const char* enumToString(PrimitiveTopology value)
     return S_INVALID;
 }
 
+const char* enumToString(AccelerationStructureKind value)
+{
+    switch (value)
+    {
+    case AccelerationStructureKind::Unknown:
+        return S_AccelerationStructureKind_Unknown;
+    case AccelerationStructureKind::BottomLevel:
+        return S_AccelerationStructureKind_BottomLevel;
+    case AccelerationStructureKind::TopLevel:
+        return S_AccelerationStructureKind_TopLevel;
+    }
+    return S_INVALID;
+}
+
 const char* enumToString(QueryType value)
 {
     switch (value)
@@ -385,8 +409,6 @@ const char* enumToString(QueryType value)
         return S_QueryType_Timestamp;
     case QueryType::AccelerationStructureCompactedSize:
         return S_QueryType_AccelerationStructureCompactedSize;
-    case QueryType::AccelerationStructureSerializedSize:
-        return S_QueryType_AccelerationStructureSerializedSize;
     case QueryType::AccelerationStructureCurrentSize:
         return S_QueryType_AccelerationStructureCurrentSize;
     }

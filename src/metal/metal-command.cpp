@@ -10,7 +10,25 @@
 #include "metal-utils.h"
 #include "../strings.h"
 
+#include <cstdio>
+
 namespace rhi::metal {
+
+static void addErrorHandler(MTL::CommandBuffer* commandBuffer)
+{
+    commandBuffer->addCompletedHandler(^(MTL::CommandBuffer* cb) {
+      if (cb->status() == MTL::CommandBufferStatusError)
+      {
+          NS::Error* error = cb->error();
+          std::fprintf(
+              stderr,
+              "Metal command buffer error: %s\n",
+              error ? error->localizedDescription()->utf8String() : "unknown"
+          );
+          SLANG_RHI_ASSERT_FAILURE("Metal command buffer error");
+      }
+    });
+}
 
 template<typename T>
 inline bool arraysEqual(uint32_t countA, uint32_t countB, const T* a, const T* b)
@@ -18,11 +36,32 @@ inline bool arraysEqual(uint32_t countA, uint32_t countB, const T* a, const T* b
     return (countA == countB) ? std::memcmp(a, b, countA * sizeof(T)) == 0 : false;
 }
 
+/// Records rhi commands into a Metal command buffer.
+///
+/// In Vulkan/D3D12, you record barriers, copies, dispatches, and draws
+/// inline into a command buffer in any order. In Metal, commands are grouped
+/// into typed "encoders" (render, compute, blit, acceleration structure),
+/// and you can only have one active encoder at a time. Switching encoder
+/// type ends the current encoder and creates a new one. This is where
+/// synchronization is required for untracked resources.
+///
+/// Each encoder created by get*CommandEncoder() calls
+/// waitForFence(m_queueFence) at creation, and endCommandEncoder() calls
+/// updateFence(m_queueFence) when ending the encoder. This is analogous to
+/// inserting a full pipeline barrier at every encoder transition -- it
+/// ensures all writes from the previous encoder are visible to the next.
+///
+/// The wait is required on EVERY encoder, including non-first encoders
+/// within the same command buffer. Unlike Vulkan where commands within a
+/// render pass have implicit ordering guarantees, Metal encoder transitions
+/// provide no automatic memory visibility for untracked resources -- the
+/// fence wait/update pair is the mechanism that provides it.
 class CommandRecorder
 {
 public:
     DeviceImpl* m_device;
 
+    CommandBufferImpl* m_commandBufferImpl = nullptr;
     NS::SharedPtr<MTL::CommandBuffer> m_commandBuffer;
     NS::SharedPtr<MTL::RenderCommandEncoder> m_renderCommandEncoder;
     NS::SharedPtr<MTL::ComputeCommandEncoder> m_computeCommandEncoder;
@@ -45,6 +84,7 @@ public:
 
     bool m_computePassActive = false;
     bool m_computeStateValid = false;
+    bool m_computeEncoderHasDispatched = false;
     RefPtr<ComputePipelineImpl> m_computePipeline;
 
     bool m_rayTracingPassActive = false;
@@ -87,10 +127,9 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
-    void cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd);
-    void cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
     void cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd);
     void cmdSetBufferState(const commands::SetBufferState& cmd);
@@ -111,15 +150,8 @@ public:
 
 Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
+    m_commandBufferImpl = commandBuffer;
     m_commandBuffer = commandBuffer->m_commandBuffer;
-
-    // Synchronize constant and argument buffers.
-    // TODO(shaderobject): This only needs to be done once after writing,
-    // once we cache/reuse binding data this should be revisited.
-    for (const auto& buffer : commandBuffer->m_bindingCache.buffers)
-    {
-        getBlitCommandEncoder()->synchronizeResource(buffer->m_buffer.get());
-    }
 
     CommandList& commandList = commandBuffer->m_commandList;
     auto command = commandList.getCommands();
@@ -145,7 +177,7 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
     return SLANG_OK;
 }
 
-#define NOT_SUPPORTED(x) m_device->printWarning(x " command is not supported!")
+#define NOT_SUPPORTED(interface, method) m_device->printWarning(#interface "::" #method " is not supported!")
 
 void CommandRecorder::cmdCopyBuffer(const commands::CopyBuffer& cmd)
 {
@@ -161,8 +193,8 @@ void CommandRecorder::cmdCopyTexture(const commands::CopyTexture& cmd)
     TextureImpl* src = checked_cast<TextureImpl*>(cmd.src);
     TextureImpl* dst = checked_cast<TextureImpl*>(cmd.dst);
 
-    const SubresourceRange& srcSubresource = cmd.srcSubresource;
-    const SubresourceRange& dstSubresource = cmd.dstSubresource;
+    SubresourceRange srcSubresource = cmd.srcSubresource;
+    SubresourceRange dstSubresource = cmd.dstSubresource;
     const Offset3D& srcOffset = cmd.srcOffset;
     const Offset3D& dstOffset = cmd.dstOffset;
     const Extent3D& extent = cmd.extent;
@@ -176,19 +208,54 @@ void CommandRecorder::cmdCopyTexture(const commands::CopyTexture& cmd)
     }
     else
     {
+        // Fix up sub resource ranges.
+        if (dstSubresource.layerCount == 0)
+            dstSubresource.layerCount = dst->m_desc.getLayerCount();
+        if (dstSubresource.mipCount == 0)
+            dstSubresource.mipCount = dst->m_desc.mipCount;
+        if (srcSubresource.layerCount == 0)
+            srcSubresource.layerCount = src->m_desc.getLayerCount();
+        if (srcSubresource.mipCount == 0)
+            srcSubresource.mipCount = src->m_desc.mipCount;
+
+        Extent3D srcTextureSize = src->m_desc.size;
         for (uint32_t layer = 0; layer < dstSubresource.layerCount; layer++)
         {
-            encoder->copyFromTexture(
-                src->m_texture.get(),
-                srcSubresource.layer + layer,
-                srcSubresource.mip,
-                MTL::Origin(srcOffset.x, srcOffset.y, srcOffset.z),
-                MTL::Size(extent.width, extent.height, extent.depth),
-                dst->m_texture.get(),
-                dstSubresource.layer + layer,
-                dstSubresource.mip,
-                MTL::Origin(dstOffset.x, dstOffset.y, dstOffset.z)
-            );
+            for (uint32_t mipOffset = 0; mipOffset < dstSubresource.mipCount; mipOffset++)
+            {
+                uint32_t srcMip = srcSubresource.mip + mipOffset;
+                uint32_t dstMip = dstSubresource.mip + mipOffset;
+
+                Extent3D srcMipSize = calcMipSize(srcTextureSize, srcMip);
+                Extent3D adjustedExtent = extent;
+                if (adjustedExtent.width == kRemainingTextureSize)
+                {
+                    SLANG_RHI_ASSERT(srcOffset.x == dstOffset.x);
+                    adjustedExtent.width = srcMipSize.width - srcOffset.x;
+                }
+                if (adjustedExtent.height == kRemainingTextureSize)
+                {
+                    SLANG_RHI_ASSERT(srcOffset.y == dstOffset.y);
+                    adjustedExtent.height = srcMipSize.height - srcOffset.y;
+                }
+                if (adjustedExtent.depth == kRemainingTextureSize)
+                {
+                    SLANG_RHI_ASSERT(srcOffset.z == dstOffset.z);
+                    adjustedExtent.depth = srcMipSize.depth - srcOffset.z;
+                }
+
+                encoder->copyFromTexture(
+                    src->m_texture.get(),
+                    srcSubresource.layer + layer,
+                    srcMip,
+                    MTL::Origin(srcOffset.x, srcOffset.y, srcOffset.z),
+                    MTL::Size(adjustedExtent.width, adjustedExtent.height, adjustedExtent.depth),
+                    dst->m_texture.get(),
+                    dstSubresource.layer + layer,
+                    dstMip,
+                    MTL::Origin(dstOffset.x, dstOffset.y, dstOffset.z)
+                );
+            }
         }
     }
 }
@@ -530,12 +597,26 @@ void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
         encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
         encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
         encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
-        encoder->useResources(m_bindingData->usedResources, m_bindingData->usedResourceCount, MTL::ResourceUsageRead);
-        encoder->useResources(
-            m_bindingData->usedRWResources,
-            m_bindingData->usedRWResourceCount,
-            MTL::ResourceUsageRead | MTL::ResourceUsageWrite
-        );
+
+        if (!m_device->m_hasResidencySet)
+        {
+            if (m_bindingData->usedResourceCount > 0)
+            {
+                encoder->useResources(
+                    (const MTL::Resource* const*)m_bindingData->usedResources,
+                    m_bindingData->usedResourceCount,
+                    MTL::ResourceUsageRead
+                );
+            }
+            if (m_bindingData->usedRWResourceCount > 0)
+            {
+                encoder->useResources(
+                    (const MTL::Resource* const*)m_bindingData->usedRWResources,
+                    m_bindingData->usedRWResourceCount,
+                    MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+                );
+            }
+        }
     }
 
     if (updateVertexBuffers)
@@ -660,19 +741,19 @@ void CommandRecorder::cmdDrawIndexed(const commands::DrawIndexed& cmd)
 void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndirect);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndirect);
 }
 
 void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndexedIndirect);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndexedIndirect);
 }
 
 void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawMeshTasks);
+    NOT_SUPPORTED(IRenderPassEncoder, drawMeshTasks);
 }
 
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
@@ -682,6 +763,7 @@ void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
 
 void CommandRecorder::cmdEndComputePass(const commands::EndComputePass& cmd)
 {
+    endCommandEncoder();
     m_computePassActive = false;
 }
 
@@ -710,12 +792,51 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
         );
         encoder->setTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
         encoder->setSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
-        encoder->useResources(m_bindingData->usedResources, m_bindingData->usedResourceCount, MTL::ResourceUsageRead);
-        encoder->useResources(
-            m_bindingData->usedRWResources,
-            m_bindingData->usedRWResourceCount,
-            MTL::ResourceUsageRead | MTL::ResourceUsageWrite
-        );
+
+        if (!m_device->m_hasResidencySet)
+        {
+            if (m_bindingData->usedResourceCount > 0)
+            {
+                encoder->useResources(
+                    (const MTL::Resource* const*)m_bindingData->usedResources,
+                    m_bindingData->usedResourceCount,
+                    MTL::ResourceUsageRead
+                );
+            }
+            if (m_bindingData->usedRWResourceCount > 0)
+            {
+                encoder->useResources(
+                    (const MTL::Resource* const*)m_bindingData->usedRWResources,
+                    m_bindingData->usedRWResourceCount,
+                    MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+                );
+            }
+
+            auto accelerationStructureResources = m_device->getAccelerationStructureResources();
+            if (!accelerationStructureResources.empty())
+            {
+                encoder->useResources(
+                    accelerationStructureResources.data(),
+                    accelerationStructureResources.size(),
+                    MTL::ResourceUsageRead
+                );
+            }
+        }
+
+        // Bind root-level acceleration structures via setAccelerationStructure:atBufferIndex:.
+        // Slang emits these as [[buffer(N)]] kernel parameters; setBuffers cannot bind them.
+        for (uint32_t i = 0; i < m_bindingData->rootAccelerationStructureCount; ++i)
+        {
+            encoder->setAccelerationStructure(
+                m_bindingData->rootAccelerationStructures[i],
+                m_bindingData->rootAccelerationStructureSlots[i]
+            );
+        }
+    }
+
+    if (m_computeEncoderHasDispatched)
+    {
+        m_computeCommandEncoder->memoryBarrier(MTL::BarrierScope(MTL::BarrierScopeBuffers | MTL::BarrierScopeTextures));
     }
 
     m_computeStateValid = true;
@@ -726,19 +847,31 @@ void CommandRecorder::cmdDispatchCompute(const commands::DispatchCompute& cmd)
     if (!m_computeStateValid)
         return;
 
+    // No automatic barrier between dispatches within a compute pass,
+    // matching Vulkan/D3D12 contract. With untracked hazard mode, Metal
+    // does not auto-synchronize even for explicitly bound resources.
+    // For dependent dispatches, callers have two options:
+    //   1. Re-bind (cmdSetComputeState emits memoryBarrier on rebind)
+    //   2. End pass, call globalBarrier(), begin new pass
     m_computeCommandEncoder->dispatchThreadgroups(MTL::Size(cmd.x, cmd.y, cmd.z), m_computePipeline->m_threadGroupSize);
+    m_computeEncoderHasDispatched = true;
 }
 
 void CommandRecorder::cmdDispatchComputeIndirect(const commands::DispatchComputeIndirect& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_ComputePassEncoder_dispatchComputeIndirect);
+    if (!m_computeStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+    m_computeCommandEncoder
+        ->dispatchThreadgroups(argBuffer->m_buffer.get(), cmd.argBuffer.offset, m_computePipeline->m_threadGroupSize);
+    m_computeEncoderHasDispatched = true;
 }
 
 void CommandRecorder::cmdBeginRayTracingPass(const commands::BeginRayTracingPass& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_beginRayTracingPass);
+    NOT_SUPPORTED(ICommandEncoder, beginRayTracingPass);
 }
 
 void CommandRecorder::cmdEndRayTracingPass(const commands::EndRayTracingPass& cmd)
@@ -754,7 +887,7 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
 void CommandRecorder::cmdDispatchRays(const commands::DispatchRays& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RayTracingPassEncoder_dispatchRays);
+    NOT_SUPPORTED(IRayTracingPassEncoder, dispatchRays);
 }
 
 void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd)
@@ -789,6 +922,12 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     // TODO handle queryDescs
 }
 
+void CommandRecorder::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(ICommandEncoder, buildMicromap);
+}
+
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
 {
     MTL::AccelerationStructureCommandEncoder* encoder = getAccelerationStructureCommandEncoder();
@@ -813,31 +952,19 @@ void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerat
 void CommandRecorder::cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_queryAccelerationStructureProperties);
-}
-
-void CommandRecorder::cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_serializeAccelerationStructure);
-}
-
-void CommandRecorder::cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_deserializeAccelerationStructure);
+    NOT_SUPPORTED(ICommandEncoder, queryAccelerationStructureProperties);
 }
 
 void CommandRecorder::cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_executeClusterOperation);
+    NOT_SUPPORTED(ICommandEncoder, executeClusterOperation);
 }
 
 void CommandRecorder::cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_convertCooperativeVectorMatrix);
+    NOT_SUPPORTED(ICommandEncoder, convertCooperativeVectorMatrix);
 }
 
 void CommandRecorder::cmdSetBufferState(const commands::SetBufferState& cmd)
@@ -853,6 +980,22 @@ void CommandRecorder::cmdSetTextureState(const commands::SetTextureState& cmd)
 void CommandRecorder::cmdGlobalBarrier(const commands::GlobalBarrier& cmd)
 {
     SLANG_UNUSED(cmd);
+    MTL::BarrierScope scope = MTL::BarrierScope(MTL::BarrierScopeBuffers | MTL::BarrierScopeTextures);
+    if (m_computeCommandEncoder)
+    {
+        m_computeCommandEncoder->memoryBarrier(scope);
+    }
+    else if (m_renderCommandEncoder)
+    {
+        m_renderCommandEncoder->memoryBarrier(
+            scope,
+            MTL::RenderStages(MTL::RenderStageVertex | MTL::RenderStageFragment),
+            MTL::RenderStages(MTL::RenderStageVertex | MTL::RenderStageFragment)
+        );
+    }
+    // Blit/AS encoders: operations within a single encoder are sequential,
+    // so no explicit barrier is needed. Encoder transitions provide
+    // inter-encoder visibility via MTL::Fence.
 }
 
 void CommandRecorder::cmdPushDebugGroup(const commands::PushDebugGroup& cmd)
@@ -886,7 +1029,11 @@ void CommandRecorder::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 
 void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 {
-    cmd.callback(cmd.userData);
+    NativeHandle nativeHandle{
+        NativeHandleType::MTLCommandBuffer,
+        reinterpret_cast<uint64_t>(m_commandBuffer.get()),
+    };
+    invokeExecuteCallback(cmd, nativeHandle);
 }
 
 MTL::RenderCommandEncoder* CommandRecorder::getRenderCommandEncoder(MTL::RenderPassDescriptor* renderPassDesc)
@@ -895,6 +1042,10 @@ MTL::RenderCommandEncoder* CommandRecorder::getRenderCommandEncoder(MTL::RenderP
     {
         endCommandEncoder();
         m_renderCommandEncoder = NS::RetainPtr(m_commandBuffer->renderCommandEncoder(renderPassDesc));
+        m_renderCommandEncoder->waitForFence(
+            m_commandBufferImpl->m_queue->m_queueFence.get(),
+            MTL::RenderStages(MTL::RenderStageVertex | MTL::RenderStageFragment)
+        );
     }
     return m_renderCommandEncoder.get();
 }
@@ -905,6 +1056,7 @@ MTL::ComputeCommandEncoder* CommandRecorder::getComputeCommandEncoder()
     {
         endCommandEncoder();
         m_computeCommandEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder());
+        m_computeCommandEncoder->waitForFence(m_commandBufferImpl->m_queue->m_queueFence.get());
     }
     return m_computeCommandEncoder.get();
 }
@@ -915,6 +1067,7 @@ MTL::AccelerationStructureCommandEncoder* CommandRecorder::getAccelerationStruct
     {
         endCommandEncoder();
         m_accelerationStructureCommandEncoder = NS::RetainPtr(m_commandBuffer->accelerationStructureCommandEncoder());
+        m_accelerationStructureCommandEncoder->waitForFence(m_commandBufferImpl->m_queue->m_queueFence.get());
     }
     return m_accelerationStructureCommandEncoder.get();
 }
@@ -925,14 +1078,21 @@ MTL::BlitCommandEncoder* CommandRecorder::getBlitCommandEncoder()
     {
         endCommandEncoder();
         m_blitCommandEncoder = NS::RetainPtr(m_commandBuffer->blitCommandEncoder());
+        m_blitCommandEncoder->waitForFence(m_commandBufferImpl->m_queue->m_queueFence.get());
     }
     return m_blitCommandEncoder.get();
 }
 
 void CommandRecorder::endCommandEncoder()
 {
+    MTL::Fence* fence = m_commandBufferImpl->m_queue->m_queueFence.get();
+
     if (m_renderCommandEncoder)
     {
+        m_renderCommandEncoder->updateFence(
+            fence,
+            MTL::RenderStages(MTL::RenderStageVertex | MTL::RenderStageFragment)
+        );
         m_renderCommandEncoder->endEncoding();
         m_renderCommandEncoder.reset();
 
@@ -942,19 +1102,25 @@ void CommandRecorder::endCommandEncoder()
     }
     if (m_computeCommandEncoder)
     {
+        m_computeCommandEncoder->updateFence(fence);
         m_computeCommandEncoder->endEncoding();
         m_computeCommandEncoder.reset();
 
         m_computeStateValid = false;
+        m_computeEncoderHasDispatched = false;
         m_computePipeline = nullptr;
     }
     if (m_accelerationStructureCommandEncoder)
     {
+        m_accelerationStructureCommandEncoder->updateFence(fence);
         m_accelerationStructureCommandEncoder->endEncoding();
         m_accelerationStructureCommandEncoder.reset();
     }
     if (m_blitCommandEncoder)
     {
+        // Blit encoders don't support useResources - residency for blit
+        // operands is handled automatically by Metal.
+        m_blitCommandEncoder->updateFence(fence);
         m_blitCommandEncoder->endEncoding();
         m_blitCommandEncoder.reset();
     }
@@ -973,6 +1139,7 @@ CommandQueueImpl::~CommandQueueImpl() {}
 void CommandQueueImpl::init(NS::SharedPtr<MTL::CommandQueue> commandQueue)
 {
     m_commandQueue = commandQueue;
+    m_queueFence = NS::TransferPtr(getDevice<DeviceImpl>()->m_device->newFence());
     m_lastSubmittedID = 1;
     m_lastFinishedID = 1;
     m_trackingEvent = NS::TransferPtr(getDevice<DeviceImpl>()->m_device->newSharedEvent());
@@ -992,6 +1159,7 @@ void CommandQueueImpl::shutdown()
 #endif
     SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
     m_commandQueue.reset();
+    m_queueFence.reset();
     m_trackingEvent.reset();
     m_trackingEventListener.reset();
 }
@@ -1045,11 +1213,11 @@ uint64_t CommandQueueImpl::updateLastFinishedID()
     return m_lastFinishedID;
 }
 
-Result CommandQueueImpl::createCommandEncoder(ICommandEncoder** outEncoder)
+Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
 {
     AUTORELEASEPOOL
 
-    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this);
+    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this, desc);
     SLANG_RETURN_ON_FAIL(encoder->init());
     returnComPtr(outEncoder, encoder);
     return SLANG_OK;
@@ -1118,7 +1286,22 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
             FenceImpl* fence = checked_cast<FenceImpl*>(desc.waitFences[i]);
             commandBuffer->encodeWait(fence->m_event.get(), desc.waitFenceValues[i]);
         }
+        addErrorHandler(commandBuffer);
         commandBuffer->commit();
+    }
+
+    // Commit any pending residency set changes.
+    {
+        auto* device = getDevice<DeviceImpl>();
+        if (device->m_hasResidencySet)
+        {
+            std::lock_guard<std::mutex> lock(device->m_residencySetMutex);
+            if (device->m_residencySetDirty)
+            {
+                device->m_residencySet->commit();
+                device->m_residencySetDirty = false;
+            }
+        }
     }
 
     // Increment submission id
@@ -1145,6 +1328,7 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
             commandBuffer->m_commandBuffer->encodeSignalEvent(m_trackingEvent.get(), m_lastSubmittedID);
         }
 
+        addErrorHandler(commandBuffer->m_commandBuffer.get());
         commandBuffer->m_commandBuffer->commit();
     }
 
@@ -1162,6 +1346,7 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
             commandBuffer->encodeSignalEvent(fence->m_event.get(), desc.signalFenceValues[i]);
         }
         commandBuffer->encodeSignalEvent(m_trackingEvent.get(), m_lastSubmittedID);
+        addErrorHandler(commandBuffer);
         commandBuffer->commit();
     }
 
@@ -1173,8 +1358,8 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
 
 // CommandEncoderImpl
 
-CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue)
-    : CommandEncoder(device)
+CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc)
+    : CommandEncoder(device, desc)
     , m_queue(queue)
 {
 }
@@ -1205,11 +1390,17 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     );
 }
 
-Result CommandEncoderImpl::finish(ICommandBuffer** outCommandBuffer)
+Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
 {
     AUTORELEASEPOOL
 
     DeviceImpl* device = getDevice<DeviceImpl>();
+    bool hadLabel = m_commandBuffer->m_desc.label != nullptr;
+    m_commandBuffer->setDesc(desc);
+    if (hadLabel)
+    {
+        m_commandBuffer->m_commandBuffer->setLabel(createString(m_commandBuffer->m_desc.label).get());
+    }
     SLANG_RETURN_ON_FAIL(resolvePipelines(device));
     CommandRecorder recorder(device);
     SLANG_RETURN_ON_FAIL(recorder.record(m_commandBuffer));

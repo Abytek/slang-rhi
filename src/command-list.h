@@ -3,10 +3,12 @@
 #include <slang-rhi.h>
 #include "core/common.h"
 #include "core/arena-allocator.h"
+#include "core/short_vector.h"
 
 #include <utility>
 #include <set>
 #include <cstring>
+#include <vector>
 
 // clang-format off
 #define SLANG_RHI_COMMANDS(x) \
@@ -37,10 +39,9 @@
     x(SetRayTracingState) \
     x(DispatchRays) \
     x(BuildAccelerationStructure) \
+    x(BuildMicromap) \
     x(CopyAccelerationStructure) \
     x(QueryAccelerationStructureProperties) \
-    x(SerializeAccelerationStructure) \
-    x(DeserializeAccelerationStructure) \
     x(ExecuteClusterOperation) \
     x(ConvertCooperativeVectorMatrix) \
     x(SetBufferState) \
@@ -260,6 +261,13 @@ struct BuildAccelerationStructure
     const AccelerationStructureQueryDesc* queryDescs;
 };
 
+struct BuildMicromap
+{
+    MicromapBuildDesc desc;
+    IMicromap* dst;
+    BufferOffsetPair scratchBuffer;
+};
+
 struct CopyAccelerationStructure
 {
     IAccelerationStructure* dst;
@@ -273,18 +281,6 @@ struct QueryAccelerationStructureProperties
     IAccelerationStructure** accelerationStructures;
     uint32_t queryCount;
     const AccelerationStructureQueryDesc* queryDescs;
-};
-
-struct SerializeAccelerationStructure
-{
-    BufferOffsetPair dst;
-    IAccelerationStructure* src;
-};
-
-struct DeserializeAccelerationStructure
-{
-    IAccelerationStructure* dst;
-    BufferOffsetPair src;
 };
 
 struct ExecuteClusterOperation
@@ -340,10 +336,7 @@ struct WriteTimestamp
 
 struct ExecuteCallback
 {
-    using Callback = void (*)(const void* userData);
-    Callback callback;
-    const void* userData;
-    Size userDataSize;
+    ExecuteCallbackDesc desc;
 };
 
 #define SLANG_RHI_COMMAND_CHECK_X(x)                                                                                   \
@@ -371,6 +364,22 @@ SLANG_RHI_COMMANDS(SLANG_RHI_COMMAND_TRAITS_X)
 
 } // namespace commands
 
+inline void invokeExecuteCallback(const commands::ExecuteCallback& cmd, NativeHandle nativeHandle)
+{
+    if (!cmd.desc.callback)
+        return;
+
+    ExecuteCallbackContext context;
+    context.nativeHandle = nativeHandle;
+    cmd.desc.callback(&context, cmd.desc.userObject, cmd.desc.userData, cmd.desc.userDataSize);
+}
+
+struct ExecuteCallbackObjectRetainer
+{
+    void* userObject = nullptr;
+    ExecuteCallbackObjectFunc releaseUserObject = nullptr;
+};
+
 
 /// A list of commands recorded by the command encoder.
 ///
@@ -397,7 +406,19 @@ public:
         void* data;
     };
 
-    CommandList(ArenaAllocator& allocator, std::set<RefPtr<RefObject>>& trackedObjects);
+    struct QueryWriteRange
+    {
+        IQueryPool* queryPool;
+        uint32_t index;
+        uint32_t count;
+    };
+    using QueryWriteRangeList = short_vector<QueryWriteRange, 16>;
+
+    CommandList(
+        ArenaAllocator& allocator,
+        std::set<RefPtr<RefObject>>& trackedObjects,
+        std::vector<ExecuteCallbackObjectRetainer>& trackedExecuteCallbackObjects
+    );
 
     void reset();
 
@@ -428,10 +449,9 @@ public:
     void write(commands::SetRayTracingState&& cmd);
     void write(commands::DispatchRays&& cmd);
     void write(commands::BuildAccelerationStructure&& cmd);
+    void write(commands::BuildMicromap&& cmd);
     void write(commands::CopyAccelerationStructure&& cmd);
     void write(commands::QueryAccelerationStructureProperties&& cmd);
-    void write(commands::SerializeAccelerationStructure&& cmd);
-    void write(commands::DeserializeAccelerationStructure&& cmd);
     void write(commands::ExecuteClusterOperation&& cmd);
     void write(commands::ConvertCooperativeVectorMatrix&& cmd);
     void write(commands::SetBufferState&& cmd);
@@ -444,6 +464,8 @@ public:
     void write(commands::ExecuteCallback&& cmd);
 
     const CommandSlot* getCommands() const { return m_commandSlots; }
+    const QueryWriteRangeList& getQueryWrites() const { return m_queryWrites; }
+    bool writesTimestamp() const { return m_writesTimestamp; }
 
     template<typename T>
     T& getCommand(const CommandSlot* command)
@@ -487,8 +509,13 @@ public:
 private:
     ArenaAllocator& m_allocator;
     std::set<RefPtr<RefObject>>& m_trackedObjects;
+    std::vector<ExecuteCallbackObjectRetainer>& m_trackedExecuteCallbackObjects;
     CommandSlot* m_commandSlots = nullptr;
     CommandSlot* m_lastCommandSlot = nullptr;
+    QueryWriteRangeList m_queryWrites;
+    bool m_writesTimestamp = false;
+
+    void trackQueryWrite(IQueryPool* queryPool, uint32_t index, uint32_t count);
 
     template<typename T>
     void writeCommand(T&& cmd)

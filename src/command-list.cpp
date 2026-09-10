@@ -3,9 +3,14 @@
 
 namespace rhi {
 
-CommandList::CommandList(ArenaAllocator& allocator, std::set<RefPtr<RefObject>>& trackedObjects)
+CommandList::CommandList(
+    ArenaAllocator& allocator,
+    std::set<RefPtr<RefObject>>& trackedObjects,
+    std::vector<ExecuteCallbackObjectRetainer>& trackedExecuteCallbackObjects
+)
     : m_allocator(allocator)
     , m_trackedObjects(trackedObjects)
+    , m_trackedExecuteCallbackObjects(trackedExecuteCallbackObjects)
 {
 }
 
@@ -13,6 +18,8 @@ void CommandList::reset()
 {
     m_commandSlots = nullptr;
     m_lastCommandSlot = nullptr;
+    m_queryWrites.clear();
+    m_writesTimestamp = false;
 }
 
 void CommandList::write(commands::CopyBuffer&& cmd)
@@ -194,36 +201,56 @@ void CommandList::write(commands::BuildAccelerationStructure&& cmd)
     {
         cmd.desc.inputs = (AccelerationStructureBuildInput*)
             writeData(cmd.desc.inputs, cmd.desc.inputCount * sizeof(AccelerationStructureBuildInput));
+        AccelerationStructureBuildInput* inputs = const_cast<AccelerationStructureBuildInput*>(cmd.desc.inputs);
         for (uint32_t i = 0; i < cmd.desc.inputCount; ++i)
         {
-            switch (cmd.desc.inputs[i].type)
+            switch (inputs[i].type)
             {
             case AccelerationStructureBuildInputType::Instances:
             {
-                const AccelerationStructureBuildInputInstances& instances = cmd.desc.inputs[i].instances;
+                const AccelerationStructureBuildInputInstances& instances = inputs[i].instances;
                 retainResource<Buffer>(instances.instanceBuffer.buffer);
                 break;
             }
             case AccelerationStructureBuildInputType::Triangles:
             {
-                const AccelerationStructureBuildInputTriangles& triangles = cmd.desc.inputs[i].triangles;
+                AccelerationStructureBuildInputTriangles& triangles = inputs[i].triangles;
                 for (uint32_t j = 0; j < triangles.vertexBufferCount; ++j)
                     retainResource<Buffer>(triangles.vertexBuffers[j].buffer);
                 retainResource<Buffer>(triangles.indexBuffer.buffer);
                 retainResource<Buffer>(triangles.preTransformBuffer.buffer);
+                if (const auto* sourceOpacityDesc =
+                        findStructInChain<AccelerationStructureOpacityMicromapDesc>(triangles.next))
+                {
+                    auto* opacityDesc = (AccelerationStructureOpacityMicromapDesc*)
+                        writeData(sourceOpacityDesc, sizeof(AccelerationStructureOpacityMicromapDesc));
+                    triangles.next = opacityDesc;
+                    // Extension chains are copied explicitly as support is added. Do not retain
+                    // a pointer into caller-owned memory for an unrecognized nested extension.
+                    opacityDesc->next = nullptr;
+                    retainResource<Micromap>(opacityDesc->link.micromap);
+                    retainResource<Buffer>(opacityDesc->link.indexBuffer.buffer);
+                    if (opacityDesc->link.usageCounts && opacityDesc->link.usageCount > 0)
+                    {
+                        opacityDesc->link.usageCounts = (MicromapUsageCount*)writeData(
+                            opacityDesc->link.usageCounts,
+                            opacityDesc->link.usageCount * sizeof(MicromapUsageCount)
+                        );
+                    }
+                }
                 break;
             }
             case AccelerationStructureBuildInputType::ProceduralPrimitives:
             {
                 const AccelerationStructureBuildInputProceduralPrimitives& proceduralPrimitives =
-                    cmd.desc.inputs[i].proceduralPrimitives;
+                    inputs[i].proceduralPrimitives;
                 for (uint32_t j = 0; j < proceduralPrimitives.aabbBufferCount; ++j)
                     retainResource<Buffer>(proceduralPrimitives.aabbBuffers[j].buffer);
                 break;
             }
             case AccelerationStructureBuildInputType::Spheres:
             {
-                const AccelerationStructureBuildInputSpheres& spheres = cmd.desc.inputs[i].spheres;
+                const AccelerationStructureBuildInputSpheres& spheres = inputs[i].spheres;
                 for (uint32_t j = 0; j < spheres.vertexBufferCount; ++j)
                 {
                     retainResource<Buffer>(spheres.vertexPositionBuffers[j].buffer);
@@ -234,7 +261,7 @@ void CommandList::write(commands::BuildAccelerationStructure&& cmd)
             }
             case AccelerationStructureBuildInputType::LinearSweptSpheres:
             {
-                const AccelerationStructureBuildInputLinearSweptSpheres lss = cmd.desc.inputs[i].linearSweptSpheres;
+                const AccelerationStructureBuildInputLinearSweptSpheres lss = inputs[i].linearSweptSpheres;
                 for (uint32_t j = 0; j < lss.vertexBufferCount; ++j)
                 {
                     retainResource<Buffer>(lss.vertexPositionBuffers[j].buffer);
@@ -254,7 +281,24 @@ void CommandList::write(commands::BuildAccelerationStructure&& cmd)
         cmd.queryDescs = (AccelerationStructureQueryDesc*)
             writeData(cmd.queryDescs, cmd.propertyQueryCount * sizeof(AccelerationStructureQueryDesc));
         for (uint32_t i = 0; i < cmd.propertyQueryCount; ++i)
+        {
             retainResource<QueryPool>(cmd.queryDescs[i].queryPool);
+            trackQueryWrite(cmd.queryDescs[i].queryPool, uint32_t(cmd.queryDescs[i].firstQueryIndex), 1);
+        }
+    }
+    writeCommand(std::move(cmd));
+}
+
+void CommandList::write(commands::BuildMicromap&& cmd)
+{
+    retainResource<Buffer>(cmd.desc.dataBuffer.buffer);
+    retainResource<Buffer>(cmd.desc.descriptorBuffer.buffer);
+    retainResource<Micromap>(cmd.dst);
+    retainResource<Buffer>(cmd.scratchBuffer.buffer);
+    if (cmd.desc.histogram && cmd.desc.histogramCount > 0)
+    {
+        cmd.desc.histogram =
+            (MicromapUsageCount*)writeData(cmd.desc.histogram, cmd.desc.histogramCount * sizeof(MicromapUsageCount));
     }
     writeCommand(std::move(cmd));
 }
@@ -280,22 +324,15 @@ void CommandList::write(commands::QueryAccelerationStructureProperties&& cmd)
         cmd.queryDescs = (AccelerationStructureQueryDesc*)
             writeData(cmd.queryDescs, cmd.queryCount * sizeof(AccelerationStructureQueryDesc));
         for (uint32_t i = 0; i < cmd.queryCount; ++i)
+        {
             retainResource<QueryPool>(cmd.queryDescs[i].queryPool);
+            trackQueryWrite(
+                cmd.queryDescs[i].queryPool,
+                uint32_t(cmd.queryDescs[i].firstQueryIndex),
+                cmd.accelerationStructureCount
+            );
+        }
     }
-    writeCommand(std::move(cmd));
-}
-
-void CommandList::write(commands::SerializeAccelerationStructure&& cmd)
-{
-    retainResource<Buffer>(cmd.dst.buffer);
-    retainResource<AccelerationStructure>(cmd.src);
-    writeCommand(std::move(cmd));
-}
-
-void CommandList::write(commands::DeserializeAccelerationStructure&& cmd)
-{
-    retainResource<AccelerationStructure>(cmd.dst);
-    retainResource<Buffer>(cmd.src.buffer);
     writeCommand(std::move(cmd));
 }
 
@@ -367,13 +404,42 @@ void CommandList::write(commands::WriteTimestamp&& cmd)
 {
     retainResource<QueryPool>(cmd.queryPool);
     writeCommand(std::move(cmd));
+    trackQueryWrite(cmd.queryPool, cmd.queryIndex, 1);
+    m_writesTimestamp = true;
 }
 
 void CommandList::write(commands::ExecuteCallback&& cmd)
 {
-    if (cmd.userData && cmd.userDataSize > 0)
-        cmd.userData = writeData(cmd.userData, cmd.userDataSize);
+    if (cmd.desc.userData && cmd.desc.userDataSize > 0)
+        cmd.desc.userData = writeData(cmd.desc.userData, cmd.desc.userDataSize);
+
+    if (cmd.desc.userObject && cmd.desc.retainUserObject && cmd.desc.releaseUserObject)
+    {
+        cmd.desc.retainUserObject(cmd.desc.userObject);
+        m_trackedExecuteCallbackObjects.push_back({cmd.desc.userObject, cmd.desc.releaseUserObject});
+    }
+
     writeCommand(std::move(cmd));
+}
+
+void CommandList::trackQueryWrite(IQueryPool* queryPool, uint32_t index, uint32_t count)
+{
+    if (!queryPool || count == 0)
+    {
+        return;
+    }
+
+    if (!m_queryWrites.empty())
+    {
+        QueryWriteRange& last = m_queryWrites.back();
+        if (last.queryPool == queryPool && last.index + last.count == index)
+        {
+            last.count += count;
+            return;
+        }
+    }
+
+    m_queryWrites.push_back({queryPool, index, count});
 }
 
 } // namespace rhi

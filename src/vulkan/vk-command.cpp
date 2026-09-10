@@ -55,6 +55,7 @@ public:
     bool m_rayTracingStateValid = false;
     RefPtr<RayTracingPipelineImpl> m_rayTracingPipeline;
     RefPtr<ShaderTableImpl> m_shaderTable;
+    ShaderTableImpl::PipelineData* m_shaderTablePipelineData = nullptr;
 
     BindingDataImpl* m_bindingData = nullptr;
 
@@ -103,10 +104,9 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
-    void cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd);
-    void cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
     void cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd);
     void cmdSetBufferState(const commands::SetBufferState& cmd);
@@ -149,7 +149,7 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 
     VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo), m_device);
 
     CommandList& commandList = commandBuffer->m_commandList;
 
@@ -194,12 +194,12 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
     commitBarriers();
     m_stateTracking.clear();
 
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkEndCommandBuffer(m_cmdBuffer));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkEndCommandBuffer(m_cmdBuffer), m_device);
 
     return SLANG_OK;
 }
 
-#define NOT_SUPPORTED(x) m_device->printWarning(x " command is not supported!")
+#define NOT_SUPPORTED(interface, method) m_device->printWarning(#interface "::" #method " is not supported!")
 
 void CommandRecorder::cmdCopyBuffer(const commands::CopyBuffer& cmd)
 {
@@ -1025,9 +1025,10 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
-        commitBarriers();
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_COMPUTE);
     }
+
+    commitBarriers();
 
     m_computeStateValid = true;
 
@@ -1073,7 +1074,7 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
 
     bool updatePipeline = !m_rayTracingStateValid || cmd.pipeline != m_rayTracingPipeline;
     bool updateBindings = updatePipeline || cmd.bindingData != m_bindingData;
-    bool updateShaderTable = !m_rayTracingStateValid || cmd.shaderTable != m_shaderTable;
+    bool updateShaderTable = updatePipeline || cmd.shaderTable != m_shaderTable;
 
     auto& api = m_device->m_api;
 
@@ -1087,37 +1088,40 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
-        commitBarriers();
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     }
 
     if (updateShaderTable)
     {
         m_shaderTable = checked_cast<ShaderTableImpl*>(cmd.shaderTable);
+        m_shaderTablePipelineData = m_shaderTable->getPipelineData(m_rayTracingPipeline);
+        if (!m_shaderTablePipelineData)
+        {
+            m_rayTracingStateValid = false;
+            return;
+        }
+        requireBufferState(m_shaderTablePipelineData->buffer, ResourceState::ShaderResource);
+        DeviceAddress shaderTableAddr =
+            m_shaderTablePipelineData->buffer->getDeviceAddress() + m_shaderTablePipelineData->tableOffset;
 
-        BufferImpl* shaderTableBuffer = m_shaderTable->getBuffer(m_rayTracingPipeline);
-        DeviceAddress shaderTableAddr = shaderTableBuffer->getDeviceAddress();
-
-        // Raygen index is set at dispatch time.
+        // Raygen address, stride, and size are set at dispatch time since each raygen
+        // shader can have a different record size.
         m_rayGenTableAddr = shaderTableAddr;
-        m_raygenSBT.stride = m_shaderTable->m_raygenRecordStride;
-        m_raygenSBT.deviceAddress = shaderTableAddr;
-        // For Vulkan, raygen SBT size must equal stride (only one raygen shader per dispatch)
-        // Multiple raygen shaders in the table are selected via deviceAddress offset at dispatch time
-        m_raygenSBT.size = m_shaderTable->m_raygenRecordStride;
 
-        m_missSBT.deviceAddress = shaderTableAddr + m_shaderTable->m_raygenTableSize;
-        m_missSBT.stride = m_shaderTable->m_missRecordStride;
-        m_missSBT.size = m_shaderTable->m_missTableSize;
+        m_missSBT.deviceAddress = shaderTableAddr + m_shaderTablePipelineData->raygenTableSize;
+        m_missSBT.stride = m_shaderTablePipelineData->missRecordStride;
+        m_missSBT.size = m_shaderTablePipelineData->missTableSize;
 
         m_hitSBT.deviceAddress = m_missSBT.deviceAddress + m_missSBT.size;
-        m_hitSBT.stride = m_shaderTable->m_hitGroupRecordStride;
-        m_hitSBT.size = m_shaderTable->m_hitTableSize;
+        m_hitSBT.stride = m_shaderTablePipelineData->hitGroupRecordStride;
+        m_hitSBT.size = m_shaderTablePipelineData->hitTableSize;
 
         m_callableSBT.deviceAddress = m_hitSBT.deviceAddress + m_hitSBT.size;
-        m_callableSBT.stride = m_shaderTable->m_callableRecordStride;
-        m_callableSBT.size = m_shaderTable->m_callableTableSize;
+        m_callableSBT.stride = m_shaderTablePipelineData->callableRecordStride;
+        m_callableSBT.size = m_shaderTablePipelineData->callableTableSize;
     }
+
+    commitBarriers();
 
     m_rayTracingStateValid = true;
 
@@ -1131,7 +1135,71 @@ void CommandRecorder::cmdDispatchRays(const commands::DispatchRays& cmd)
     if (!m_rayTracingStateValid)
         return;
 
-    m_raygenSBT.deviceAddress = m_rayGenTableAddr + cmd.rayGenShaderIndex * m_raygenSBT.stride;
+    if (cmd.rayGenShaderIndex >= m_shaderTable->m_rayGenShaderCount)
+        return;
+
+    // Copy entry point parameters to the SBT for the selected raygen shader.
+    // This allows ray tracing shaders to receive uniform parameters via the shader record.
+    SLANG_RHI_ASSERT(cmd.rayGenShaderIndex < m_shaderTablePipelineData->raygenInfos.size());
+    const auto& raygenInfo = m_shaderTablePipelineData->raygenInfos[cmd.rayGenShaderIndex];
+    if (raygenInfo.paramsSize > 0 && raygenInfo.entryPointIndex < m_bindingData->entryPointCount)
+    {
+        const auto& entryPointData = m_bindingData->entryPointData[raygenInfo.entryPointIndex];
+        if (entryPointData.data && entryPointData.size > 0)
+        {
+            // Insert a barrier to ensure any shader reads of the SBT are finished before we update it.
+            VkMemoryBarrier preUpdateBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            preUpdateBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            preUpdateBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            m_api.vkCmdPipelineBarrier(
+                m_cmdBuffer,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                1,
+                &preUpdateBarrier,
+                0,
+                nullptr,
+                0,
+                nullptr
+            );
+
+            // Use vkCmdUpdateBuffer to copy entry point data to the SBT.
+            // The data is written at the raygen's sbtOffset (after the shader group handle).
+            VkDeviceSize dstOffset = m_shaderTablePipelineData->tableOffset + raygenInfo.sbtOffset;
+            VkDeviceSize copySize = std::min(entryPointData.size, raygenInfo.paramsSize);
+            m_api.vkCmdUpdateBuffer(
+                m_cmdBuffer,
+                m_shaderTablePipelineData->buffer->m_buffer.m_buffer,
+                dstOffset,
+                copySize,
+                entryPointData.data
+            );
+
+            // Insert a barrier to ensure the update is visible before tracing rays.
+            VkMemoryBarrier postUpdateBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            postUpdateBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            postUpdateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            m_api.vkCmdPipelineBarrier(
+                m_cmdBuffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0,
+                1,
+                &postUpdateBarrier,
+                0,
+                nullptr,
+                0,
+                nullptr
+            );
+        }
+    }
+
+    // Set raygen SBT address and size based on the selected raygen shader.
+    // Each raygen shader can have a different record size.
+    m_raygenSBT.deviceAddress = m_rayGenTableAddr + raygenInfo.recordOffset;
+    m_raygenSBT.stride = raygenInfo.recordSize;
+    m_raygenSBT.size = raygenInfo.recordSize;
 
     m_api.vkCmdTraceRaysKHR(
         m_cmdBuffer,
@@ -1203,6 +1271,19 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
                     checked_cast<BufferImpl*>(input.triangles.preTransformBuffer.buffer),
                     ResourceState::AccelerationStructureBuildInput
                 );
+            }
+            if (const auto* ommDesc = findStructInChain<AccelerationStructureOpacityMicromapDesc>(input.triangles.next))
+            {
+                if (ommDesc->link.micromap)
+                    requireBufferState(
+                        checked_cast<MicromapImpl*>(ommDesc->link.micromap)->m_buffer,
+                        ResourceState::MicromapRead
+                    );
+                if (ommDesc->link.indexBuffer)
+                    requireBufferState(
+                        checked_cast<BufferImpl*>(ommDesc->link.indexBuffer.buffer),
+                        ResourceState::AccelerationStructureBuildInput
+                    );
             }
             break;
         case AccelerationStructureBuildInputType::ProceduralPrimitives:
@@ -1294,6 +1375,24 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     }
 }
 
+void CommandRecorder::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    if (!m_device->m_api.vkCmdBuildMicromapsEXT)
+        return;
+    MicromapImpl* dst = checked_cast<MicromapImpl*>(cmd.dst);
+    requireBufferState(dst->m_buffer, ResourceState::MicromapWrite);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.scratchBuffer.buffer), ResourceState::UnorderedAccess);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.dataBuffer.buffer), ResourceState::MicromapBuildInput);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.descriptorBuffer.buffer), ResourceState::MicromapBuildInput);
+    MicromapBuildDescConverter converter;
+    if (SLANG_FAILED(converter.convert(cmd.desc)))
+        return;
+    commitBarriers();
+    converter.buildInfo.dstMicromap = dst->m_vkHandle;
+    converter.buildInfo.scratchData.deviceAddress = cmd.scratchBuffer.getDeviceAddress();
+    m_device->m_api.vkCmdBuildMicromapsEXT(m_cmdBuffer, 1, &converter.buildInfo);
+}
+
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
 {
     AccelerationStructureImpl* dst = checked_cast<AccelerationStructureImpl*>(cmd.dst);
@@ -1326,42 +1425,6 @@ void CommandRecorder::cmdQueryAccelerationStructureProperties(const commands::Qu
         cmd.queryCount,
         cmd.queryDescs
     );
-}
-
-void CommandRecorder::cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd)
-{
-    BufferImpl* dstBuffer = checked_cast<BufferImpl*>(cmd.dst.buffer);
-    AccelerationStructureImpl* src = checked_cast<AccelerationStructureImpl*>(cmd.src);
-
-    requireBufferState(dstBuffer, ResourceState::UnorderedAccess);
-    requireBufferState(src->m_buffer, ResourceState::AccelerationStructureRead);
-    commitBarriers();
-
-    VkCopyAccelerationStructureToMemoryInfoKHR copyInfo = {
-        VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_TO_MEMORY_INFO_KHR
-    };
-    copyInfo.src = src->m_vkHandle;
-    copyInfo.dst.deviceAddress = cmd.dst.getDeviceAddress();
-    copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR;
-    m_api.vkCmdCopyAccelerationStructureToMemoryKHR(m_cmdBuffer, &copyInfo);
-}
-
-void CommandRecorder::cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd)
-{
-    AccelerationStructureImpl* dst = checked_cast<AccelerationStructureImpl*>(cmd.dst);
-    BufferImpl* srcBuffer = checked_cast<BufferImpl*>(cmd.src.buffer);
-
-    requireBufferState(dst->m_buffer, ResourceState::AccelerationStructureWrite);
-    requireBufferState(srcBuffer, ResourceState::ShaderResource);
-    commitBarriers();
-
-    VkCopyMemoryToAccelerationStructureInfoKHR copyInfo = {
-        VK_STRUCTURE_TYPE_COPY_MEMORY_TO_ACCELERATION_STRUCTURE_INFO_KHR
-    };
-    copyInfo.src.deviceAddress = cmd.src.getDeviceAddress();
-    copyInfo.dst = dst->m_vkHandle;
-    copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR;
-    m_api.vkCmdCopyMemoryToAccelerationStructureKHR(m_cmdBuffer, &copyInfo);
 }
 
 void CommandRecorder::cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd)
@@ -1560,7 +1623,19 @@ void CommandRecorder::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 
 void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 {
-    cmd.callback(cmd.userData);
+    commitBarriers();
+
+    NativeHandle nativeHandle{
+        NativeHandleType::VkCommandBuffer,
+        reinterpret_cast<uint64_t>(m_cmdBuffer),
+    };
+    invokeExecuteCallback(cmd, nativeHandle);
+
+    m_renderStateValid = false;
+    m_preparedRenderStateValid = false;
+    m_computeStateValid = false;
+    m_rayTracingStateValid = false;
+    m_bindingData = nullptr;
 }
 
 void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPoint bindPoint)
@@ -1671,8 +1746,10 @@ void CommandRecorder::commitBarriers()
     {
         BufferImpl* buffer = checked_cast<BufferImpl*>(bufferBarrier.buffer);
 
-        VkPipelineStageFlags beforeStageFlags = calcPipelineStageFlags(bufferBarrier.stateBefore, true);
-        VkPipelineStageFlags afterStageFlags = calcPipelineStageFlags(bufferBarrier.stateAfter, false);
+        VkPipelineStageFlags beforeStageFlags =
+            calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, bufferBarrier.stateBefore, true);
+        VkPipelineStageFlags afterStageFlags =
+            calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, bufferBarrier.stateAfter, false);
 
         if ((beforeStageFlags != activeBeforeStageFlags || afterStageFlags != activeAfterStageFlags) &&
             !bufferBarriers.empty())
@@ -1706,8 +1783,10 @@ void CommandRecorder::commitBarriers()
     {
         TextureImpl* texture = checked_cast<TextureImpl*>(textureBarrier.texture);
 
-        VkPipelineStageFlags beforeStageFlags = calcPipelineStageFlags(textureBarrier.stateBefore, true);
-        VkPipelineStageFlags afterStageFlags = calcPipelineStageFlags(textureBarrier.stateAfter, false);
+        VkPipelineStageFlags beforeStageFlags =
+            calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, textureBarrier.stateBefore, true);
+        VkPipelineStageFlags afterStageFlags =
+            calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, textureBarrier.stateAfter, false);
 
         if ((beforeStageFlags != activeBeforeStageFlags || afterStageFlags != activeAfterStageFlags) &&
             !imageBarriers.empty())
@@ -1777,9 +1856,6 @@ void CommandRecorder::queryAccelerationStructureProperties(
         case QueryType::AccelerationStructureCompactedSize:
             queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
             break;
-        case QueryType::AccelerationStructureSerializedSize:
-            queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR;
-            break;
         case QueryType::AccelerationStructureCurrentSize:
             continue;
         default:
@@ -1790,15 +1866,17 @@ void CommandRecorder::queryAccelerationStructureProperties(
             );
             return;
         }
-        auto queryPool = checked_cast<QueryPoolImpl*>(queryDescs[i].queryPool)->m_pool;
-        m_device->m_api.vkCmdResetQueryPool(m_cmdBuffer, queryPool, (uint32_t)queryDescs[i].firstQueryIndex, 1);
+        auto queryPoolImpl = checked_cast<QueryPoolImpl*>(queryDescs[i].queryPool);
+        auto queryPool = queryPoolImpl->m_pool;
+        uint32_t queryIndex = (uint32_t)queryDescs[i].firstQueryIndex;
+        m_device->m_api.vkCmdResetQueryPool(m_cmdBuffer, queryPool, queryIndex, accelerationStructureCount);
         m_device->m_api.vkCmdWriteAccelerationStructuresPropertiesKHR(
             m_cmdBuffer,
             accelerationStructureCount,
             vkHandles.data(),
             queryType,
             queryPool,
-            queryDescs[i].firstQueryIndex
+            queryIndex
         );
     }
 }
@@ -1818,6 +1896,19 @@ void CommandQueueImpl::init(VkQueue queue, uint32_t queueFamilyIndex)
     m_queue = queue;
     m_queueFamilyIndex = queueFamilyIndex;
 
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    const Size constantBufferAlignment = m_api.m_deviceProperties.limits.minUniformBufferOffsetAlignment;
+    TransientBufferHeapDesc constantBufferHeapDesc;
+    constantBufferHeapDesc.initialPageSize = 64 * 1024;
+    constantBufferHeapDesc.maxPageSize = 4 * 1024 * 1024;
+    constantBufferHeapDesc.maxRetainedSize = 4 * 1024 * 1024;
+    constantBufferHeapDesc.memoryType = MemoryType::Upload;
+    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer;
+    constantBufferHeapDesc.defaultState = ResourceState::ConstantBuffer;
+    constantBufferHeapDesc.alignment = constantBufferAlignment;
+    constantBufferHeapDesc.allocationGranularity = constantBufferAlignment;
+    m_constantBufferHeap.initialize(device, constantBufferHeapDesc);
+
     {
         VkSemaphoreTypeCreateInfo timelineCreateInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         timelineCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -1830,8 +1921,13 @@ void CommandQueueImpl::init(VkQueue queue, uint32_t queueFamilyIndex)
 void CommandQueueImpl::shutdown()
 {
     waitOnHost();
+    // A failed device wait may leave command buffers in the in-flight list. Destroy them before
+    // releasing the heap so their allocation handles cannot outlive its pages.
+    m_commandBuffersInFlight.clear();
     // Release all command buffers in order to release all resources they may hold.
     m_commandBuffersPool.clear();
+    // Release the shared constant-buffer pages while deferred deletion is still available.
+    m_constantBufferHeap.release();
     // Execute remaining deferred deletes.
     executeDeferredDeletes();
     SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
@@ -1892,6 +1988,10 @@ void CommandQueueImpl::retireCommandBuffers()
         }
     }
 
+    // The internal device queue shares this VkQueue. Polling it here releases
+    // initialization staging allocations even if no further internal work occurs.
+    getDevice<DeviceImpl>()->m_deviceQueue.retireCompletedResources();
+
     // Delete deferred resources that are no longer in use by the GPU.
     executeDeferredDeletes();
 
@@ -1926,9 +2026,9 @@ uint64_t CommandQueueImpl::updateLastFinishedID()
     return m_lastFinishedID;
 }
 
-Result CommandQueueImpl::createCommandEncoder(ICommandEncoder** outEncoder)
+Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
 {
-    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this);
+    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this, desc);
     SLANG_RETURN_ON_FAIL(encoder->init());
     returnComPtr(outEncoder, encoder);
     return SLANG_OK;
@@ -1945,6 +2045,11 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     {
         CommandBufferImpl* commandBuffer = checked_cast<CommandBufferImpl*>(desc.commandBuffers[i]);
         commandBuffer->m_submissionID = m_lastSubmittedID;
+        for (const auto& queryWrite : commandBuffer->m_commandList.getQueryWrites())
+        {
+            checked_cast<QueryPool*>(queryWrite.queryPool)
+                ->markQueryRangeSubmitted(queryWrite.index, queryWrite.count, m_lastSubmittedID);
+        }
         m_commandBuffersInFlight.push_back(commandBuffer);
         vkCommandBuffers.push_back(commandBuffer->m_commandBuffer);
     }
@@ -2023,7 +2128,7 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
         timelineSubmitInfo.pSignalSemaphoreValues = signalValues.data();
     }
 
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkQueueSubmit(m_queue, 1, &submitInfo, m_surfaceSync.fence));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkQueueSubmit(m_queue, 1, &submitInfo, m_surfaceSync.fence), m_device);
     m_surfaceSync.fence = VK_NULL_HANDLE;
 
     retireCommandBuffers();
@@ -2035,7 +2140,7 @@ Result CommandQueueImpl::waitOnHost()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
     auto& api = device->m_api;
-    api.vkQueueWaitIdle(m_queue);
+    SLANG_VK_RETURN_ON_FAIL_REPORT(api.vkQueueWaitIdle(m_queue), device);
     retireCommandBuffers();
     return SLANG_OK;
 }
@@ -2047,10 +2152,47 @@ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
     return SLANG_OK;
 }
 
+Result CommandQueueImpl::getTimestampCalibration(TimestampCalibration* outCalibration)
+{
+    if (!outCalibration)
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    const CalibratedTimestampSupport& timestampSupport = device->m_calibratedTimestampSupport;
+    if (!timestampSupport.available || !m_api.vkGetCalibratedTimestampsKHR)
+    {
+        return SLANG_E_NOT_AVAILABLE;
+    }
+
+    VkCalibratedTimestampInfoKHR timestampInfos[2] = {};
+    timestampInfos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    timestampInfos[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+    timestampInfos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    timestampInfos[1].timeDomain = timestampSupport.hostTimeDomain;
+
+    uint64_t timestamps[2] = {};
+    uint64_t maxDeviation = 0;
+    SLANG_VK_RETURN_ON_FAIL_REPORT(
+        m_api.vkGetCalibratedTimestampsKHR(m_api.m_device, 2, timestampInfos, timestamps, &maxDeviation),
+        m_device
+    );
+
+    outCalibration->cpuDomain = timestampSupport.cpuTimestampDomain;
+    outCalibration->cpuTimestamp = timestamps[1];
+    outCalibration->cpuFrequency = timestampSupport.cpuTimestampFrequency;
+    outCalibration->gpuTimestamp = timestamps[0];
+    outCalibration->gpuFrequency = device->getInfo().timestampFrequency;
+    outCalibration->maxDeviationNs = maxDeviation;
+
+    return SLANG_OK;
+}
+
 // CommandEncoderImpl
 
-CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue)
-    : CommandEncoder(device)
+CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc)
+    : CommandEncoder(device, desc)
     , m_queue(queue)
 {
 }
@@ -2078,7 +2220,7 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     builder.m_device = getDevice<DeviceImpl>();
     builder.m_allocator = &m_commandBuffer->m_allocator;
     builder.m_bindingCache = &m_commandBuffer->m_bindingCache;
-    builder.m_constantBufferPool = &m_commandBuffer->m_constantBufferPool;
+    builder.m_constantBufferArena = &m_commandBuffer->m_constantBufferArena;
     builder.m_descriptorSetAllocator = &m_commandBuffer->m_descriptorSetAllocator;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
@@ -2089,10 +2231,20 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     );
 }
 
-Result CommandEncoderImpl::finish(ICommandBuffer** outCommandBuffer)
+Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
 {
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    bool hadLabel = m_commandBuffer->m_desc.label != nullptr;
+    m_commandBuffer->setDesc(desc);
+    if (hadLabel)
+    {
+        device->_labelObject(
+            (uint64_t)m_commandBuffer->m_commandBuffer,
+            VK_OBJECT_TYPE_COMMAND_BUFFER,
+            m_commandBuffer->m_desc.label
+        );
+    }
     SLANG_RETURN_ON_FAIL(resolvePipelines(m_device));
-    m_commandBuffer->m_constantBufferPool.finish();
     CommandRecorder recorder(getDevice<DeviceImpl>());
     SLANG_RETURN_ON_FAIL(recorder.record(m_commandBuffer));
     returnComPtr(outCommandBuffer, m_commandBuffer);
@@ -2139,22 +2291,24 @@ CommandBufferImpl::~CommandBufferImpl()
 Result CommandBufferImpl::init()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
-    m_constantBufferPool.init(device);
+    m_constantBufferArena.initialize(&m_queue->m_constantBufferHeap);
     m_descriptorSetAllocator.init(&device->m_api);
 
     VkCommandPoolCreateInfo createInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     createInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     createInfo.queueFamilyIndex = m_queue->m_queueFamilyIndex;
-    SLANG_VK_RETURN_ON_FAIL(
-        device->m_api.vkCreateCommandPool(device->m_api.m_device, &createInfo, nullptr, &m_commandPool)
+    SLANG_VK_RETURN_ON_FAIL_REPORT(
+        device->m_api.vkCreateCommandPool(device->m_api.m_device, &createInfo, nullptr, &m_commandPool),
+        device
     );
 
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = m_commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
-    SLANG_VK_RETURN_ON_FAIL(
-        device->m_api.vkAllocateCommandBuffers(device->m_api.m_device, &allocInfo, &m_commandBuffer)
+    SLANG_VK_RETURN_ON_FAIL_REPORT(
+        device->m_api.vkAllocateCommandBuffers(device->m_api.m_device, &allocInfo, &m_commandBuffer),
+        device
     );
 
     return SLANG_OK;
@@ -2164,8 +2318,8 @@ Result CommandBufferImpl::reset()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
     m_commandList.reset();
-    SLANG_VK_RETURN_ON_FAIL(device->m_api.vkResetCommandPool(device->m_device, m_commandPool, 0));
-    m_constantBufferPool.reset();
+    SLANG_VK_RETURN_ON_FAIL_REPORT(device->m_api.vkResetCommandPool(device->m_device, m_commandPool, 0), device);
+    m_constantBufferArena.reset();
     m_descriptorSetAllocator.reset();
     m_bindingCache.reset();
     return CommandBuffer::reset();

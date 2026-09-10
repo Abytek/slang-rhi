@@ -104,6 +104,13 @@ const FormatMapping& getFormatMapping(Format format)
         { Format::BC6HSfloat,       DXGI_FORMAT_BC6H_TYPELESS,          DXGI_FORMAT_BC6H_SF16,                  DXGI_FORMAT_BC6H_SF16               },
         { Format::BC7Unorm,         DXGI_FORMAT_BC7_TYPELESS,           DXGI_FORMAT_BC7_UNORM,                  DXGI_FORMAT_BC7_UNORM               },
         { Format::BC7UnormSrgb,     DXGI_FORMAT_BC7_TYPELESS,           DXGI_FORMAT_BC7_UNORM_SRGB,             DXGI_FORMAT_BC7_UNORM_SRGB          },
+
+        { Format::ASTC4x4Unorm,     DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
+        { Format::ASTC4x4UnormSrgb, DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
+        { Format::ASTC6x6Unorm,     DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
+        { Format::ASTC6x6UnormSrgb, DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
+        { Format::ASTC8x8Unorm,     DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
+        { Format::ASTC8x8UnormSrgb, DXGI_FORMAT_UNKNOWN,                DXGI_FORMAT_UNKNOWN,                    DXGI_FORMAT_UNKNOWN                 },
         // clang-format on
     };
 
@@ -252,6 +259,8 @@ Result compileHLSLShader(
 #endif // SLANG_ENABLE_DXBC_SUPPORT
 }
 
+static SharedLibraryHandle s_dxgiModule;
+
 SharedLibraryHandle getDXGIModule()
 {
 #if SLANG_WINDOWS_FAMILY
@@ -260,17 +269,24 @@ SharedLibraryHandle getDXGIModule()
     const char* const libName = "libdxvk_dxgi.so";
 #endif
 
-    static SharedLibraryHandle s_dxgiModule = [&]()
+    if (!s_dxgiModule)
     {
-        SharedLibraryHandle h = nullptr;
-        loadSharedLibrary(libName, h);
-        if (!h)
+        loadSharedLibrary(libName, s_dxgiModule);
+        if (!s_dxgiModule)
         {
             fprintf(stderr, "error: failed to load dll '%s'\n", libName);
         }
-        return h;
-    }();
+    }
     return s_dxgiModule;
+}
+
+void clearDXGIModule()
+{
+    if (s_dxgiModule)
+    {
+        unloadSharedLibrary(s_dxgiModule);
+        s_dxgiModule = nullptr;
+    }
 }
 
 Result createDXGIFactory(bool debug, ComPtr<IDXGIFactory>& outFactory)
@@ -317,45 +333,75 @@ Result createDXGIFactory(bool debug, ComPtr<IDXGIFactory>& outFactory)
     }
 }
 
+SLANG_RHI_STATIC_MUTEX_BEGIN
+static std::mutex s_dxgiFactoryMutex;
+SLANG_RHI_STATIC_MUTEX_END
+static IDXGIFactory* s_dxgiFactory;
+static DebugLayerOptions s_previousDebugLayerOptions;
+
 // Get `DXGIFactory`.
 // Warnings will be emitted via the `device` (if not present), else, stderr.
 ComPtr<IDXGIFactory> getDXGIFactory(DebugLayerOptions debugLayerOptions, Device* device)
 {
-    static ComPtr<IDXGIFactory> factory;
-    /// Tracks if the current DXGIFactory created is debug.
-    static DebugLayerOptions previousDebugLayerOptions;
+    std::lock_guard<std::mutex> lock(s_dxgiFactoryMutex);
 
-    // Try to remake our current `factory` if:
-    // 1. factory is null
+    // Try to remake our current `s_dxgiFactory` if:
+    // 1. s_dxgiFactory is null
     // 2. The current `getDXGIFactory` settings do not match the previous settings.
-    if (factory == ComPtr<IDXGIFactory>() || previousDebugLayerOptions != debugLayerOptions)
+    if (s_dxgiFactory && s_previousDebugLayerOptions == debugLayerOptions)
     {
-        factory.setNull();
+        return ComPtr<IDXGIFactory>(s_dxgiFactory);
     }
-    else
-        return factory;
 
-    factory = [&debugLayerOptions, &device]()
+    if (s_dxgiFactory)
     {
-        ComPtr<IDXGIFactory> f;
-        if (SLANG_FAILED(createDXGIFactory(debugLayerOptions.isDebugLayersEnabled(), f)))
+        s_dxgiFactory->Release();
+        s_dxgiFactory = nullptr;
+    }
+
+    ComPtr<IDXGIFactory> dxgiFactory;
+    if (SLANG_FAILED(createDXGIFactory(debugLayerOptions.isDebugLayersEnabled(), dxgiFactory)))
+    {
+        // If debug was enabled && debug is *not* required, try again without debug
+        if (debugLayerOptions.isDebugLayersEnabled() && !debugLayerOptions.required)
         {
-            // If debug was enabled && debug is *not* required, try again without debug
-            if (debugLayerOptions.isDebugLayersEnabled() && !debugLayerOptions.required)
+            if (device)
+                device->printWarning("Failed to create a debug DXGIFactory.");
+            else
+                fprintf(stderr, "WARNING: Failed to create a debug DXGIFactory.");
+            debugLayerOptions = DebugLayerOptions();
+            if (SLANG_FAILED(createDXGIFactory(debugLayerOptions.isDebugLayersEnabled(), dxgiFactory)))
             {
-                if (device)
-                    device->printWarning("Failed to create a debug DXGIFactory.");
-                else
-                    fprintf(stderr, "WARNING: Failed to create a debug DXGIFactory.");
-                DebugLayerOptions newDebugLayerOptions = DebugLayerOptions();
-                return getDXGIFactory(newDebugLayerOptions, device);
+                return ComPtr<IDXGIFactory>();
             }
+        }
+        else
+        {
             return ComPtr<IDXGIFactory>();
         }
-        previousDebugLayerOptions = debugLayerOptions;
-        return f;
-    }();
-    return factory;
+    }
+
+    s_previousDebugLayerOptions = debugLayerOptions;
+
+    if (dxgiFactory)
+    {
+        s_dxgiFactory = dxgiFactory;
+        s_dxgiFactory->AddRef();
+    }
+
+    return dxgiFactory;
+}
+
+void clearDXGIFactory()
+{
+    std::lock_guard<std::mutex> lock(s_dxgiFactoryMutex);
+
+    if (s_dxgiFactory)
+    {
+        s_dxgiFactory->Release();
+        s_dxgiFactory = nullptr;
+    }
+    s_previousDebugLayerOptions = {};
 }
 
 Result enumAdapters(IDXGIFactory* dxgiFactory, std::vector<ComPtr<IDXGIAdapter>>& outAdapters)
@@ -454,6 +500,39 @@ AdapterLUID getAdapterLUID(LUID luid)
     SLANG_RHI_ASSERT(sizeof(AdapterLUID) >= sizeof(LUID));
     memcpy(&adapterLUID, &luid, sizeof(LUID));
     return adapterLUID;
+}
+
+const char* getHRESULTName(HRESULT res)
+{
+#define CASE(x)                                                                                                        \
+    case x:                                                                                                            \
+        return #x;
+    switch (res)
+    {
+        CASE(S_OK)
+        CASE(S_FALSE)
+        CASE(E_FAIL)
+        CASE(E_INVALIDARG)
+        CASE(E_OUTOFMEMORY)
+        CASE(E_NOTIMPL)
+        CASE(E_NOINTERFACE)
+        CASE(DXGI_ERROR_INVALID_CALL)
+        CASE(DXGI_ERROR_NOT_FOUND)
+        CASE(DXGI_ERROR_MORE_DATA)
+        CASE(DXGI_ERROR_UNSUPPORTED)
+        CASE(DXGI_ERROR_DEVICE_REMOVED)
+        CASE(DXGI_ERROR_DEVICE_HUNG)
+        CASE(DXGI_ERROR_DEVICE_RESET)
+        CASE(DXGI_ERROR_WAIT_TIMEOUT)
+    default:
+        return "<unknown>";
+    }
+#undef CASE
+}
+
+void reportD3DError(HRESULT result, const char* call, const SourceLocation location, Device* device)
+{
+    reportNativeCallError(device, call, result, getHRESULTName(result), location);
 }
 
 uint32_t getPlaneSliceCount(DXGI_FORMAT format)
