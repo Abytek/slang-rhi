@@ -65,12 +65,6 @@ BufferRange Buffer::resolveBufferRange(const BufferRange& range)
     return resolved;
 }
 
-Result Buffer::getNativeHandle(NativeHandle* outHandle)
-{
-    *outHandle = {};
-    return SLANG_E_NOT_AVAILABLE;
-}
-
 Result Buffer::getSharedHandle(NativeHandle* outHandle)
 {
     *outHandle = {};
@@ -83,6 +77,12 @@ Result Buffer::getDescriptorHandle(
     BufferRange range,
     DescriptorHandle* outHandle
 )
+{
+    *outHandle = {};
+    return SLANG_E_NOT_AVAILABLE;
+}
+
+Result Buffer::getNativeHandle(NativeHandle* outHandle)
 {
     *outHandle = {};
     return SLANG_E_NOT_AVAILABLE;
@@ -128,7 +128,7 @@ Result calcSubresourceRegionLayout(
 
     size_t rowSize = math::divideRoundedUp(extent.width, formatInfo.blockWidth) * formatInfo.blockSizeInBytes;
     size_t rowCount = math::divideRoundedUp(extent.height, formatInfo.blockHeight);
-    size_t rowPitch = math::calcAligned2(rowSize, rowAlignment);
+    size_t rowPitch = math::calcAligned(rowSize, rowAlignment);
     size_t layerPitch = rowPitch * rowCount;
 
     outLayout->size = extent;
@@ -185,12 +185,6 @@ bool Texture::isEntireTexture(const SubresourceRange& range)
     return true;
 }
 
-Result Texture::getNativeHandle(NativeHandle* outHandle)
-{
-    *outHandle = {};
-    return SLANG_E_NOT_AVAILABLE;
-}
-
 Result Texture::getSharedHandle(NativeHandle* outHandle)
 {
     *outHandle = {};
@@ -217,6 +211,12 @@ Result Texture::createView(const TextureViewDesc& desc, ITextureView** outTextur
     return m_device->createTextureView(this, desc, outTextureView);
 }
 
+Result Texture::getNativeHandle(NativeHandle* outHandle)
+{
+    *outHandle = {};
+    return SLANG_E_NOT_AVAILABLE;
+}
+
 // ----------------------------------------------------------------------------
 // TextureView
 // ----------------------------------------------------------------------------
@@ -236,12 +236,6 @@ TextureView::TextureView(Device* device, const TextureViewDesc& desc)
     m_sampler = checked_cast<Sampler*>(m_desc.sampler);
 }
 
-Result TextureView::getNativeHandle(NativeHandle* outHandle)
-{
-    *outHandle = {};
-    return SLANG_E_NOT_AVAILABLE;
-}
-
 Result TextureView::getDescriptorHandle(DescriptorHandleAccess access, DescriptorHandle* outHandle)
 {
     *outHandle = {};
@@ -249,6 +243,12 @@ Result TextureView::getDescriptorHandle(DescriptorHandleAccess access, Descripto
 }
 
 Result TextureView::getCombinedTextureSamplerDescriptorHandle(DescriptorHandle* outHandle)
+{
+    *outHandle = {};
+    return SLANG_E_NOT_AVAILABLE;
+}
+
+Result TextureView::getNativeHandle(NativeHandle* outHandle)
 {
     *outHandle = {};
     return SLANG_E_NOT_AVAILABLE;
@@ -270,11 +270,6 @@ Sampler::Sampler(Device* device, const SamplerDesc& desc)
     , m_desc(desc)
 {
     m_descHolder.holdString(m_desc.label);
-}
-
-const SamplerDesc& Sampler::getDesc()
-{
-    return m_desc;
 }
 
 Result Sampler::getDescriptorHandle(DescriptorHandle* outHandle)
@@ -320,6 +315,24 @@ Result AccelerationStructure::getDescriptorHandle(DescriptorHandle* outHandle)
 }
 
 // ----------------------------------------------------------------------------
+// Micromap
+// ----------------------------------------------------------------------------
+
+IMicromap* Micromap::getInterface(const Guid& guid)
+{
+    if (guid == ISlangUnknown::getTypeGuid() || guid == IResource::getTypeGuid() || guid == IMicromap::getTypeGuid())
+        return static_cast<IMicromap*>(this);
+    return nullptr;
+}
+
+Micromap::Micromap(Device* device, const MicromapDesc& desc)
+    : Resource(device)
+    , m_desc(desc)
+{
+    m_descHolder.holdString(m_desc.label);
+}
+
+// ----------------------------------------------------------------------------
 // InputLayout
 // ----------------------------------------------------------------------------
 
@@ -346,6 +359,120 @@ QueryPool::QueryPool(Device* device, const QueryPoolDesc& desc)
     , m_desc(desc)
 {
     m_descHolder.holdString(m_desc.label);
+    m_querySlotStates.resize(m_desc.count);
+}
+
+Result QueryPool::getResultState(uint32_t queryIndex, uint32_t count, QueryResultState* outState)
+{
+    if (!outState || !isValidQueryRange(queryIndex, count))
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    *outState = getQueryRangeInfo(queryIndex, count).state;
+
+    return SLANG_OK;
+}
+
+Result QueryPool::reset()
+{
+    return reset(0, m_desc.count);
+}
+
+Result QueryPool::reset(uint32_t queryIndex, uint32_t count)
+{
+    if (!isValidQueryRange(queryIndex, count))
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(m_queryStateMutex);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        QuerySlotState& slotState = m_querySlotStates[queryIndex + i];
+        slotState.set(QueryResultState::Reset, 0);
+    }
+
+    return SLANG_OK;
+}
+
+bool QueryPool::isValidQueryRange(uint32_t queryIndex, uint32_t count) const
+{
+    if (count == 0)
+    {
+        return queryIndex <= m_desc.count;
+    }
+    return queryIndex < m_desc.count && count <= m_desc.count - queryIndex;
+}
+
+void QueryPool::markQueryRangeSubmitted(uint32_t queryIndex, uint32_t count, uint64_t submissionID)
+{
+    if (!isValidQueryRange(queryIndex, count))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_queryStateMutex);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        QuerySlotState& slotState = m_querySlotStates[queryIndex + i];
+        slotState.set(QueryResultState::Pending, submissionID);
+    }
+}
+
+void QueryPool::markQueryRangeResolved(uint32_t queryIndex, uint32_t count, uint64_t completedSubmissionID)
+{
+    if (!isValidQueryRange(queryIndex, count))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_queryStateMutex);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        QuerySlotState& slotState = m_querySlotStates[queryIndex + i];
+        QueryResultState state = slotState.getState();
+        uint64_t submissionID = slotState.getSubmissionID();
+        if (state == QueryResultState::Pending && submissionID <= completedSubmissionID)
+        {
+            slotState.set(QueryResultState::Resolved, submissionID);
+        }
+    }
+}
+
+QueryPool::QueryRangeInfo QueryPool::getQueryRangeInfo(uint32_t queryIndex, uint32_t count) const
+{
+    if (!isValidQueryRange(queryIndex, count))
+    {
+        return {QueryResultState::Reset, 0};
+    }
+
+    if (count == 0)
+    {
+        return {QueryResultState::Resolved, 0};
+    }
+
+    QueryRangeInfo info;
+    std::lock_guard<std::mutex> lock(m_queryStateMutex);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const QuerySlotState& slotState = m_querySlotStates[queryIndex + i];
+        QueryResultState state = slotState.getState();
+        if (state == QueryResultState::Reset)
+        {
+            return {QueryResultState::Reset, 0};
+        }
+        if (state == QueryResultState::Pending)
+        {
+            info.state = QueryResultState::Pending;
+        }
+        info.submissionID = std::max(info.submissionID, slotState.getSubmissionID());
+    }
+    if (info.state != QueryResultState::Pending)
+    {
+        info.state = QueryResultState::Resolved;
+    }
+    return info;
 }
 
 // ----------------------------------------------------------------------------
@@ -449,6 +576,19 @@ void Surface::setInfo(const SurfaceInfo& info)
 void Surface::setConfig(const SurfaceConfig& config)
 {
     m_config = config;
+}
+
+Result Surface::validateConfig(const SurfaceConfig& config) const
+{
+    if (config.format != Format::Undefined && !contains(m_info.formats, m_info.formatCount, config.format))
+        return SLANG_E_INVALID_ARG;
+    if (config.usage != (config.usage & m_info.supportedUsage))
+        return SLANG_E_INVALID_ARG;
+    if (config.width == 0 || config.height == 0)
+        return SLANG_E_INVALID_ARG;
+    if (config.desiredImageCount == 0)
+        return SLANG_E_INVALID_ARG;
+    return SLANG_OK;
 }
 
 // ----------------------------------------------------------------------------

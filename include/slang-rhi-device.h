@@ -187,6 +187,34 @@ struct AccelerationStructureInstanceDescMetal
     uint32_t userID;
 };
 
+/// Axis-aligned bounding box structure matching D3D12_RAYTRACING_AABB, VkAabbPositionsNV and OptixAabb.
+struct AABB
+{
+    float minX;
+    float minY;
+    float minZ;
+    float maxX;
+    float maxY;
+    float maxZ;
+};
+
+// ----------------------------------------------------------------------------
+// Micromaps
+// ----------------------------------------------------------------------------
+
+/// GPU-side descriptor for one opacity micromap. This layout is portable across the
+/// supported native APIs.
+struct MicromapTriangleDesc
+{
+    uint32_t dataOffset;
+    uint16_t subdivisionLevel;
+    uint16_t format;
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(MicromapTriangleDesc) == 8, "MicromapTriangleDesc must match the native API layout");
+#endif
+
 // ----------------------------------------------------------------------------
 // Cluster operations
 // ----------------------------------------------------------------------------

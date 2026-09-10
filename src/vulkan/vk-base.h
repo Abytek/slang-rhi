@@ -11,6 +11,7 @@
 
 namespace rhi::vk {
 
+class BackendImpl;
 class AdapterImpl;
 class DeviceImpl;
 class InputLayoutImpl;
@@ -20,6 +21,7 @@ class TextureImpl;
 class TextureViewImpl;
 class SamplerImpl;
 class AccelerationStructureImpl;
+class MicromapImpl;
 class RenderPipelineImpl;
 class ComputePipelineImpl;
 class RayTracingPipelineImpl;

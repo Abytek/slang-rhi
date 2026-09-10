@@ -107,6 +107,13 @@ inline const FormatMapping& getFormatMapping(Format format)
         { Format::BC6HSfloat,       CU_AD_FORMAT_BC6H_SF16,         CU_RES_VIEW_FORMAT_SIGNED_BC6H,     16, 3,  0           },
         { Format::BC7Unorm,         CU_AD_FORMAT_BC7_UNORM,         CU_RES_VIEW_FORMAT_UNSIGNED_BC7,    16, 4,  0           },
         { Format::BC7UnormSrgb,     CU_AD_FORMAT_BC7_UNORM_SRGB,    CU_RES_VIEW_FORMAT_UNSIGNED_BC7,    16, 4,  FLAG_SRGB   },
+
+        { Format::ASTC4x4Unorm,     CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
+        { Format::ASTC4x4UnormSrgb, CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
+        { Format::ASTC6x6Unorm,     CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
+        { Format::ASTC6x6UnormSrgb, CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
+        { Format::ASTC8x8Unorm,     CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
+        { Format::ASTC8x8UnormSrgb, CUarray_format(0),              CU_RES_VIEW_FORMAT_NONE,            0,  0,  0           },
         // clang-format on
     };
 
@@ -145,6 +152,10 @@ TextureImpl::~TextureImpl()
     {
         SLANG_CUDA_ASSERT_ON_FAIL(cuMipmappedArrayDestroy(m_cudaMipMappedArray));
     }
+    if (m_cudaExternalMemory)
+    {
+        SLANG_CUDA_ASSERT_ON_FAIL(cuDestroyExternalMemory((CUexternalMemory)m_cudaExternalMemory));
+    }
 }
 
 void TextureImpl::deleteThis()
@@ -178,6 +189,7 @@ Result TextureImpl::getDefaultView(ITextureView** outTextureView)
         SLANG_RETURN_ON_FAIL(m_device->createTextureView(this, {}, (ITextureView**)m_defaultView.writeRef()));
         m_defaultView->setInternalReferenceCount(1);
     }
+
     returnComPtr(outTextureView, m_defaultView);
     return SLANG_OK;
 }
@@ -188,8 +200,6 @@ CUtexObject TextureImpl::getTexObject(
     const SubresourceRange& range
 )
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-
     ViewKey key = {format, samplerSettings, range};
     CUtexObject& texObject = m_texObjects[key];
     if (texObject)
@@ -243,8 +253,6 @@ CUtexObject TextureImpl::getTexObject(
 
 CUsurfObject TextureImpl::getSurfObject(const SubresourceRange& range)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-
     CUsurfObject& surfObject = m_surfObjects[range];
     if (surfObject)
         return surfObject;
@@ -496,6 +504,17 @@ Result DeviceImpl::createTextureFromSharedHandle(
     ITexture** outTexture
 )
 {
+    return createTextureFromSharedHandle(handle, desc, size, false, outTexture);
+}
+
+Result DeviceImpl::createTextureFromSharedHandle(
+    NativeHandle handle,
+    const TextureDesc& desc,
+    const size_t size,
+    bool isDedicated,
+    ITexture** outTexture
+)
+{
     if (!handle)
     {
         *outTexture = nullptr;
@@ -523,7 +542,7 @@ Result DeviceImpl::createTextureFromSharedHandle(
     }
     externalMemoryHandleDesc.handle.win32.handle = (void*)handle.value;
     externalMemoryHandleDesc.size = size;
-    externalMemoryHandleDesc.flags = 0; // CUDA_EXTERNAL_MEMORY_DEDICATED;
+    externalMemoryHandleDesc.flags = isDedicated ? CUDA_EXTERNAL_MEMORY_DEDICATED : 0;
 
     CUexternalMemory externalMemory;
     SLANG_CUDA_RETURN_ON_FAIL_REPORT(cuImportExternalMemory(&externalMemory, &externalMemoryHandleDesc), this);
@@ -541,7 +560,10 @@ Result DeviceImpl::createTextureFromSharedHandle(
     CUDA_ARRAY3D_DESCRIPTOR arrayDesc = {};
     arrayDesc.Format = mapping.arrayFormat;
     arrayDesc.NumChannels = mapping.channelCount;
-    arrayDesc.Flags = 0; // TODO: Flags? CUDA_ARRAY_LAYERED/SURFACE_LDST/CUBEMAP/TEXTURE_GATHER
+    if (is_set(desc.usage, TextureUsage::UnorderedAccess))
+    {
+        arrayDesc.Flags |= CUDA_ARRAY3D_SURFACE_LDST;
+    }
 
     switch (desc.type)
     {
@@ -631,12 +653,10 @@ Result TextureViewImpl::getDescriptorHandle(DescriptorHandleAccess access, Descr
     switch (access)
     {
     case DescriptorHandleAccess::Read:
-        outHandle->type = DescriptorHandleType::Texture;
-        outHandle->value = (uint64_t)getTexObject();
+        *outHandle = DescriptorHandle{DescriptorHandleType::Texture, (uint64_t)getTexObject()};
         break;
     case DescriptorHandleAccess::ReadWrite:
-        outHandle->type = DescriptorHandleType::RWTexture;
-        outHandle->value = (uint64_t)getSurfObject();
+        *outHandle = DescriptorHandle{DescriptorHandleType::RWTexture, (uint64_t)getSurfObject()};
         break;
     default:
         return SLANG_E_INVALID_ARG;

@@ -25,25 +25,22 @@ SurfaceImpl::~SurfaceImpl() {}
 
 Result SurfaceImpl::configure(const SurfaceConfig& config)
 {
+    SLANG_RETURN_ON_FAIL(validateConfig(config));
     setConfig(config);
-
-    if (m_config.width == 0 || m_config.height == 0)
-    {
-        return SLANG_FAIL;
-    }
     if (m_config.format == Format::Undefined)
     {
         m_config.format = m_info.preferredFormat;
     }
     if (m_config.usage == TextureUsage::None)
     {
-        // TODO: Once we have propert support for format support, we can add additional usages depending on the format.
-        m_config.usage = TextureUsage::Present | TextureUsage::RenderTarget | TextureUsage::CopyDestination;
+        m_config.usage = (TextureUsage::Present | TextureUsage::RenderTarget | TextureUsage::CopyDestination) &
+                         m_info.supportedUsage;
     }
 
     m_metalLayer->setPixelFormat(translatePixelFormat(m_config.format));
     m_metalLayer->setDrawableSize(CGSize{(float)m_config.width, (float)m_config.height});
-    m_metalLayer->setFramebufferOnly(m_config.usage == TextureUsage::RenderTarget);
+    const TextureUsage framebufferOnlyUsage = TextureUsage::Present | TextureUsage::RenderTarget;
+    m_metalLayer->setFramebufferOnly((m_config.usage & ~framebufferOnlyUsage) == TextureUsage::None);
     // m_metalLayer->setDisplaySyncEnabled(config.vsync);
     m_configured = true;
 
@@ -63,6 +60,10 @@ Result SurfaceImpl::acquireNextImage(ITexture** outTexture)
     {
         return SLANG_FAIL;
     }
+
+    // Scoped pool drains autoreleased temporaries from nextDrawable() at
+    // function exit. The drawable itself survives via NS::RetainPtr.
+    AUTORELEASEPOOL
 
     m_currentDrawable = NS::RetainPtr(m_metalLayer->nextDrawable());
     if (!m_currentDrawable)
@@ -97,10 +98,11 @@ Result SurfaceImpl::present()
         return SLANG_FAIL;
     }
 
+    AUTORELEASEPOOL
+
     MTL::CommandBuffer* commandBuffer = m_device->m_commandQueue->commandBuffer();
     commandBuffer->presentDrawable(m_currentDrawable.get());
     commandBuffer->commit();
-    commandBuffer->release();
     m_currentDrawable.reset();
 
     return SLANG_OK;

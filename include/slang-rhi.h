@@ -57,7 +57,7 @@ typedef SlangResult Result;
 typedef size_t Size;
 typedef size_t Offset;
 
-const uint64_t kTimeoutInfinite = 0xFFFFFFFFFFFFFFFF;
+constexpr uint64_t kTimeoutInfinite{0xFFFFFFFFFFFFFFFFU};
 
 
 enum class StructType
@@ -69,6 +69,8 @@ enum class StructType
     TextureViewDesc,
     SamplerDesc,
     AccelerationStructureDesc,
+    MicromapDesc,
+    AccelerationStructureOpacityMicromapDesc,
     FenceDesc,
     RenderPipelineDesc,
     ComputePipelineDesc,
@@ -77,6 +79,9 @@ enum class StructType
     QueryPoolDesc,
     DeviceDesc,
     HeapDesc,
+
+    CommandEncoderDesc,
+    CommandBufferDesc,
 
     D3D12DeviceExtendedDesc,
     D3D12ExperimentalFeaturesDesc,
@@ -124,9 +129,11 @@ enum class DeviceType
     x(ShaderExecutionReordering,                "shader-execution-reordering"                   ) \
     x(RayTracingMotionBlur,                     "ray-tracing-motion-blur"                       ) \
     x(RayTracingValidation,                     "ray-tracing-validation"                        ) \
+    x(OpacityMicromap,                          "opacity-micromap"                              ) \
     x(ClusterAccelerationStructure,             "cluster-acceleration-structure"                ) \
     /* Other features */                                                                          \
     x(TimestampQuery,                           "timestamp-query"                               ) \
+    x(TimestampCalibration,                     "timestamp-calibration"                         ) \
     x(RealtimeClock,                            "realtime-clock"                                ) \
     x(CooperativeVector,                        "cooperative-vector"                            ) \
     x(CooperativeMatrix,                        "cooperative-matrix"                            ) \
@@ -142,6 +149,7 @@ enum class DeviceType
     x(SM_6_7,                                   "sm_6_7"                                        ) \
     x(SM_6_8,                                   "sm_6_8"                                        ) \
     x(SM_6_9,                                   "sm_6_9"                                        ) \
+    x(SM_6_10,                                  "sm_6_10"                                       ) \
     x(Half,                                     "half"                                          ) \
     x(Double,                                   "double"                                        ) \
     x(Int16,                                    "int16"                                         ) \
@@ -162,8 +170,10 @@ enum class DeviceType
     x(ProgrammableSamplePositions2,             "programmable-sample-positions-2"               ) \
     /* Vulkan specific features */                                                                \
     x(ShaderResourceMinLod,                     "shader-resource-min-lod"                       ) \
+    x(ShaderAbort,                              "shader-abort"                                  ) \
     /* Metal specific features */                                                                 \
     x(ArgumentBufferTier2,                      "argument-buffer-tier-2"                        ) \
+    x(ResidencySet,                             "residency-set"                                 ) \
     /* CUDA specific features */                                                                  \
     x(AtomicBfloat16,                           "atomic-bfloat16"                               )
 // clang-format on
@@ -191,6 +201,20 @@ struct CompilationReport
     /// Time point in nanoseconds.
     typedef uint64_t TimePoint;
 
+    struct CacheKeyDigest
+    {
+        /// Digest type, or None if a cache key is unavailable.
+        enum class Type : uint8_t
+        {
+            None,
+            SHA1,
+        };
+
+        Type type;
+        /// SHA-1 digest bytes, or zeroes when type is None.
+        uint8_t bytes[20];
+    };
+
     struct EntryPointReport
     {
         char name[128];
@@ -202,6 +226,8 @@ struct CompilationReport
         double compileDownstreamTime;
         bool isCached;
         size_t cacheSize;
+        /// Stable digest of the opaque persistent shader-cache key.
+        CacheKeyDigest cacheKey;
     };
 
     enum class PipelineType
@@ -219,6 +245,8 @@ struct CompilationReport
         double createTime;
         bool isCached;
         size_t cacheSize;
+        /// Stable digest of the opaque persistent pipeline-cache key.
+        CacheKeyDigest cacheKey;
     };
 
     /// Shader program label.
@@ -266,7 +294,8 @@ enum class LinkingStyle
 
 struct ShaderProgramDesc
 {
-    StructType type = StructType::ShaderProgramDesc;
+    static constexpr StructType kStructType = StructType::ShaderProgramDesc;
+    StructType type = kStructType;
     const void* next = nullptr;
 
     // TODO: Tess doesn't like this but doesn't know what to do about it
@@ -398,6 +427,14 @@ enum class Format
     BC7Unorm,
     BC7UnormSrgb,
 
+    // ASTC compressed formats
+    ASTC4x4Unorm,
+    ASTC4x4UnormSrgb,
+    ASTC6x6Unorm,
+    ASTC6x6UnormSrgb,
+    ASTC8x8Unorm,
+    ASTC8x8UnormSrgb,
+
     _Count,
 };
 
@@ -520,6 +557,9 @@ enum class ResourceState
     AccelerationStructureRead,
     AccelerationStructureWrite,
     AccelerationStructureBuildInput,
+    MicromapBuildInput,
+    MicromapRead,
+    MicromapWrite,
 };
 
 /// Describes how memory for the resource should be allocated for CPU access.
@@ -536,6 +576,8 @@ enum class NativeHandleType
 
     Win32 = 0x00000001,
     FileDescriptor = 0x00000002,
+
+    D3D11DeviceContext = 0x00010001,
 
     D3D12Device = 0x00020001,
     D3D12CommandQueue = 0x00020002,
@@ -559,6 +601,7 @@ enum class NativeHandleType
     VkSampler = 0x0003000a,
     VkPipeline = 0x0003000b,
     VkSemaphore = 0x0003000c,
+    VkMicromapEXT = 0x0003000d,
 
     MTLDevice = 0x00040001,
     MTLCommandQueue = 0x00040002,
@@ -659,7 +702,8 @@ struct VertexStreamDesc
 
 struct InputLayoutDesc
 {
-    StructType structType = StructType::InputLayoutDesc;
+    static constexpr StructType kStructType = StructType::InputLayoutDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     const InputElementDesc* inputElements = nullptr;
@@ -714,14 +758,17 @@ enum class BufferUsage
     CopyDestination = (1 << 7),
     AccelerationStructure = (1 << 8),
     AccelerationStructureBuildInput = (1 << 9),
-    ShaderTable = (1 << 10),
-    Shared = (1 << 11),
+    MicromapBuildInput = (1 << 10),
+    MicromapStorage = (1 << 11),
+    ShaderTable = (1 << 12),
+    Shared = (1 << 13),
 };
 SLANG_RHI_ENUM_CLASS_OPERATORS(BufferUsage);
 
 struct BufferDesc
 {
-    StructType structType = StructType::BufferDesc;
+    static constexpr StructType kStructType = StructType::BufferDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     /// Total size in bytes.
@@ -989,7 +1036,8 @@ static const SubresourceRange kAllSubresources = {0, kAllLayers, 0, kAllMips};
 
 struct TextureDesc
 {
-    StructType structType = StructType::TextureDesc;
+    static constexpr StructType kStructType = StructType::TextureDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     TextureType type = TextureType::Texture2D;
@@ -1038,7 +1086,8 @@ struct TextureDesc
 
 struct TextureViewDesc
 {
-    StructType structType = StructType::TextureViewDesc;
+    static constexpr StructType kStructType = StructType::TextureViewDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     Format format = Format::Undefined;
@@ -1154,7 +1203,8 @@ enum class TextureReductionOp
 
 struct SamplerDesc
 {
-    StructType structType = StructType::SamplerDesc;
+    static constexpr StructType kStructType = StructType::SamplerDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     TextureFilteringMode minFilter = TextureFilteringMode::Linear;
@@ -1230,7 +1280,9 @@ enum class AccelerationStructureInstanceFlags : uint32_t
     TriangleFacingCullDisable = (1 << 0),
     TriangleFrontCounterClockwise = (1 << 1),
     ForceOpaque = (1 << 2),
-    NoOpaque = (1 << 3)
+    NoOpaque = (1 << 3),
+    ForceOpacityMicromap2State = (1 << 4),
+    DisableOpacityMicromaps = (1 << 5),
 };
 SLANG_RHI_ENUM_CLASS_OPERATORS(AccelerationStructureInstanceFlags);
 
@@ -1301,6 +1353,9 @@ struct AccelerationStructureBuildInputTriangles
     BufferOffsetPair preTransformBuffer;
 
     AccelerationStructureGeometryFlags flags;
+
+    /// Optional chain of typed geometry extensions.
+    const void* next = nullptr;
 };
 
 struct AccelerationStructureBuildInputProceduralPrimitives
@@ -1397,7 +1452,9 @@ enum class AccelerationStructureBuildFlags
     PreferFastTrace = (1 << 2),
     PreferFastBuild = (1 << 3),
     MinimizeMemory = (1 << 4),
-    CreateMotion = (1 << 5)
+    CreateMotion = (1 << 5),
+    AllowOpacityMicromapUpdate = (1 << 6),
+    AllowDisableOpacityMicromaps = (1 << 7),
 };
 SLANG_RHI_ENUM_CLASS_OPERATORS(AccelerationStructureBuildFlags);
 
@@ -1435,11 +1492,20 @@ struct AccelerationStructureMotionCreateInfo
     uint32_t maxInstances = 0;
 };
 
+enum class AccelerationStructureKind
+{
+    Unknown,
+    BottomLevel,
+    TopLevel,
+};
+
 struct AccelerationStructureDesc
 {
-    StructType structType = StructType::AccelerationStructureDesc;
+    static constexpr StructType kStructType = StructType::AccelerationStructureDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
+    AccelerationStructureKind kind = AccelerationStructureKind::Unknown;
     uint64_t size;
     AccelerationStructureBuildFlags flags = AccelerationStructureBuildFlags::None;
 
@@ -1453,9 +1519,121 @@ class IAccelerationStructure : public IResource
     SLANG_COM_INTERFACE(0x38b056d5, 0x63de, 0x49ca, {0xa0, 0xed, 0x62, 0xa1, 0xbe, 0xc3, 0xd4, 0x65});
 
 public:
+    virtual SLANG_NO_THROW const AccelerationStructureDesc& SLANG_MCALL getDesc() = 0;
     virtual SLANG_NO_THROW AccelerationStructureHandle SLANG_MCALL getHandle() = 0;
     virtual SLANG_NO_THROW DeviceAddress SLANG_MCALL getDeviceAddress() = 0;
     virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(DescriptorHandle* outHandle) = 0;
+};
+
+// Micromaps
+
+enum class MicromapType
+{
+    Opacity,
+};
+
+enum class OpacityMicromapFormat : uint32_t
+{
+    TwoState = 1,
+    FourState = 2,
+};
+
+enum class OpacityMicromapSpecialIndex : int32_t
+{
+    FullyTransparent = -1,
+    FullyOpaque = -2,
+    FullyUnknownTransparent = -3,
+    FullyUnknownOpaque = -4,
+};
+
+/// Host-side count for one subdivision-level/format combination.
+struct MicromapUsageCount
+{
+    uint32_t count;
+    uint32_t subdivisionLevel;
+    uint32_t format;
+};
+
+enum class MicromapIndexingMode
+{
+    Linear,
+    Indexed,
+};
+
+enum class MicromapIndexFormat
+{
+    None,
+    Uint16,
+    Uint32,
+};
+
+struct AccelerationStructureMicromapLink
+{
+    /// The referenced micromap must remain alive while an acceleration structure built
+    /// with this link may be used.
+    class IMicromap* micromap = nullptr;
+    MicromapIndexingMode indexingMode = MicromapIndexingMode::Linear;
+    BufferOffsetPair indexBuffer;
+    MicromapIndexFormat indexFormat = MicromapIndexFormat::None;
+    uint32_t indexStride = 0;
+    uint32_t baseMicromapIndex = 0;
+
+    const MicromapUsageCount* usageCounts = nullptr;
+    uint32_t usageCount = 0;
+};
+
+struct AccelerationStructureOpacityMicromapDesc
+{
+    static constexpr StructType kStructType = StructType::AccelerationStructureOpacityMicromapDesc;
+    StructType structType = kStructType;
+    const void* next = nullptr;
+    AccelerationStructureMicromapLink link;
+};
+
+enum class MicromapBuildFlags : uint32_t
+{
+    None = 0,
+    PreferFastTrace = (1 << 0),
+    PreferFastBuild = (1 << 1),
+    AllowCompaction = (1 << 2),
+};
+SLANG_RHI_ENUM_CLASS_OPERATORS(MicromapBuildFlags);
+
+struct MicromapBuildDesc
+{
+    MicromapType type = MicromapType::Opacity;
+    MicromapBuildFlags flags = MicromapBuildFlags::None;
+    BufferOffsetPair dataBuffer;
+    BufferOffsetPair descriptorBuffer;
+    uint32_t descriptorStride = sizeof(MicromapTriangleDesc);
+    const MicromapUsageCount* histogram = nullptr;
+    uint32_t histogramCount = 0;
+};
+
+struct MicromapSizes
+{
+    uint64_t micromapSize = 0;
+    uint64_t scratchSize = 0;
+};
+
+struct MicromapDesc
+{
+    static constexpr StructType kStructType = StructType::MicromapDesc;
+    StructType structType = kStructType;
+    const void* next = nullptr;
+    MicromapType type = MicromapType::Opacity;
+    uint64_t size = 0;
+    MicromapBuildFlags flags = MicromapBuildFlags::None;
+    const char* label = nullptr;
+};
+
+class IMicromap : public IResource
+{
+    SLANG_COM_INTERFACE(0xbda4e8ec, 0xf62c, 0x4ef6, {0xb0, 0x9f, 0x9e, 0x84, 0x5b, 0x1b, 0xf7, 0xe4});
+
+public:
+    virtual SLANG_NO_THROW const MicromapDesc& SLANG_MCALL getDesc() = 0;
+    virtual SLANG_NO_THROW DeviceAddress SLANG_MCALL getDeviceAddress() = 0;
 };
 
 // Cluster Acceleration Structure API
@@ -1602,7 +1780,8 @@ struct ClusterOperationSizes
 
 struct FenceDesc
 {
-    StructType structType = StructType::FenceDesc;
+    static constexpr StructType kStructType = StructType::FenceDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     uint64_t initialValue = 0;
@@ -1916,9 +2095,24 @@ struct MultisampleDesc
     bool alphaToOneEnable = false;
 };
 
+enum class PipelineCompilationPolicy
+{
+    /// Inherit the device's pipeline compilation behavior. Pipelines are compiled immediately on devices using
+    /// serial pipeline compilation and deferred on devices using parallel pipeline compilation.
+    Default,
+
+    /// Compile target code and create the backend pipeline during pipeline creation. Programs that require
+    /// specialization are always deferred.
+    Immediate,
+
+    /// Defer target code compilation and backend pipeline creation until the pipeline is used by a command encoder.
+    Deferred,
+};
+
 struct RenderPipelineDesc
 {
-    StructType structType = StructType::RenderPipelineDesc;
+    static constexpr StructType kStructType = StructType::RenderPipelineDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     IShaderProgram* program = nullptr;
@@ -1930,22 +2124,23 @@ struct RenderPipelineDesc
     RasterizerDesc rasterizer;
     MultisampleDesc multisample;
 
-    // Defer target code compilation of program to dispatch time.
-    bool deferTargetCompilation = false;
+    /// Controls when target code and the backend pipeline are compiled.
+    PipelineCompilationPolicy compilationPolicy = PipelineCompilationPolicy::Default;
 
     const char* label = nullptr;
 };
 
 struct ComputePipelineDesc
 {
-    StructType structType = StructType::ComputePipelineDesc;
+    static constexpr StructType kStructType = StructType::ComputePipelineDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     IShaderProgram* program = nullptr;
     void* d3d12RootSignatureOverride = nullptr;
 
-    // Defer target code compilation of program to dispatch time.
-    bool deferTargetCompilation = false;
+    /// Controls when target code and the backend pipeline are compiled.
+    PipelineCompilationPolicy compilationPolicy = PipelineCompilationPolicy::Default;
 
     const char* label = nullptr;
 };
@@ -1959,6 +2154,7 @@ enum class RayTracingPipelineFlags
     EnableLinearSweptSpheres = (1 << 3),
     EnableClusters = (1 << 4),
     EnableMotion = (1 << 5),
+    EnableOpacityMicromaps = (1 << 6),
 };
 SLANG_RHI_ENUM_CLASS_OPERATORS(RayTracingPipelineFlags);
 
@@ -1972,7 +2168,8 @@ struct HitGroupDesc
 
 struct RayTracingPipelineDesc
 {
-    StructType structType = StructType::RayTracingPipelineDesc;
+    static constexpr StructType kStructType = StructType::RayTracingPipelineDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     IShaderProgram* program = nullptr;
@@ -1983,8 +2180,8 @@ struct RayTracingPipelineDesc
     uint32_t maxAttributeSizeInBytes = 8;
     RayTracingPipelineFlags flags = RayTracingPipelineFlags::None;
 
-    // Defer target code compilation of program to dispatch time.
-    bool deferTargetCompilation = false;
+    /// Controls when target code and the backend pipeline are compiled.
+    PipelineCompilationPolicy compilationPolicy = PipelineCompilationPolicy::Default;
 
     const char* label = nullptr;
 };
@@ -2002,23 +2199,24 @@ struct ShaderRecordOverwrite
 
 struct ShaderTableDesc
 {
-    StructType structType = StructType::ShaderTableDesc;
+    static constexpr StructType kStructType = StructType::ShaderTableDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     uint32_t rayGenShaderCount = 0;
-    const char** rayGenShaderEntryPointNames = nullptr;
+    const char* const* rayGenShaderEntryPointNames = nullptr;
     const ShaderRecordOverwrite* rayGenShaderRecordOverwrites = nullptr;
 
     uint32_t missShaderCount = 0;
-    const char** missShaderEntryPointNames = nullptr;
+    const char* const* missShaderEntryPointNames = nullptr;
     const ShaderRecordOverwrite* missShaderRecordOverwrites = nullptr;
 
     uint32_t hitGroupCount = 0;
-    const char** hitGroupNames = nullptr;
+    const char* const* hitGroupNames = nullptr;
     const ShaderRecordOverwrite* hitGroupRecordOverwrites = nullptr;
 
     uint32_t callableShaderCount = 0;
-    const char** callableShaderEntryPointNames = nullptr;
+    const char* const* callableShaderEntryPointNames = nullptr;
     const ShaderRecordOverwrite* callableShaderRecordOverwrites = nullptr;
 
     IShaderProgram* program = nullptr;
@@ -2099,17 +2297,26 @@ struct Viewport
 enum class WindowHandleType
 {
     Undefined,
+#if !SLANG_WASM
     HWND,
     NSWindow,
     XlibWindow,
     AndroidWindow,
+#else
+    WGPUCanvas,
+#endif
 };
 
 struct WindowHandle
 {
     WindowHandleType type = WindowHandleType::Undefined;
+#if !SLANG_WASM
     uint64_t handleValues[2];
+#else
+    char canvasSelector[128];
+#endif
 
+#if !SLANG_WASM
     static WindowHandle fromHwnd(void* hwnd)
     {
         WindowHandle handle = {};
@@ -2139,6 +2346,21 @@ struct WindowHandle
         handle.handleValues[0] = (uint64_t)(window);
         return handle;
     }
+#else
+    static WindowHandle fromWGPUCanvas(const char* canvasSelector)
+    {
+        WindowHandle handle = {};
+        handle.type = WindowHandleType::WGPUCanvas;
+        if (canvasSelector)
+        {
+            size_t i = 0;
+            for (; i < sizeof(handle.canvasSelector) - 1 && canvasSelector[i]; ++i)
+                handle.canvasSelector[i] = canvasSelector[i];
+            handle.canvasSelector[i] = 0;
+        }
+        return handle;
+    }
+#endif
 };
 
 enum class LoadOp
@@ -2187,13 +2409,20 @@ enum class QueryType
 {
     Timestamp,
     AccelerationStructureCompactedSize,
-    AccelerationStructureSerializedSize,
     AccelerationStructureCurrentSize,
+};
+
+enum class QueryResultState
+{
+    Reset,
+    Pending,
+    Resolved,
 };
 
 struct QueryPoolDesc
 {
-    StructType structType = StructType::QueryPoolDesc;
+    static constexpr StructType kStructType = StructType::QueryPoolDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     QueryType type = QueryType::Timestamp;
@@ -2208,8 +2437,39 @@ class IQueryPool : public ISlangUnknown
 
 public:
     virtual SLANG_NO_THROW const QueryPoolDesc& SLANG_MCALL getDesc() = 0;
-    virtual SLANG_NO_THROW Result SLANG_MCALL getResult(uint32_t queryIndex, uint32_t count, uint64_t* data) = 0;
+
+    /// Non-blocking host-state check for query results.
+    ///
+    /// Sets outState to Reset when any query in the range has no valid submitted result,
+    /// including newly-created, reset, or never-submitted queries. Sets outState to Pending
+    /// when every query in the range has valid submitted work, but at least one result is not
+    /// host-readable yet. Sets outState to Resolved when every result in the range is
+    /// host-readable. A valid zero-count state check succeeds and returns Resolved.
+    ///
+    /// This call may poll or otherwise progress backend readiness, but it does not wait for
+    /// GPU work. Returns SLANG_E_INVALID_ARG for invalid ranges or a null outState pointer.
+    virtual SLANG_NO_THROW Result SLANG_MCALL getResultState(
+        uint32_t queryIndex,
+        uint32_t count,
+        QueryResultState* outState
+    ) = 0;
+
+    /// Read query results on the host.
+    ///
+    /// Blocks until the latest submitted work required by the requested range is complete.
+    /// Returns SLANG_FAIL if any query in the range has no valid submitted result, and
+    /// SLANG_E_INVALID_ARG for invalid ranges or a null outData pointer.
+    /// Reusing a query slot without reset is allowed; host reads return the most recent
+    /// submitted result tracked for that slot.
+    virtual SLANG_NO_THROW Result SLANG_MCALL getResult(uint32_t queryIndex, uint32_t count, uint64_t* outData) = 0;
+
+    /// Reset all queries, invalidating any host-readable results.
     virtual SLANG_NO_THROW Result SLANG_MCALL reset() = 0;
+
+    /// Reset a range of queries, invalidating any host-readable results for that range.
+    ///
+    /// A valid zero-count reset succeeds and has no effect.
+    virtual SLANG_NO_THROW Result SLANG_MCALL reset(uint32_t queryIndex, uint32_t count) = 0;
 };
 
 struct DrawArguments
@@ -2362,11 +2622,23 @@ struct MarkerColor
     float b;
 };
 
+struct CommandBufferDesc
+{
+    static constexpr StructType kStructType = StructType::CommandBufferDesc;
+    StructType structType = kStructType;
+    const void* next = nullptr;
+
+    /// The name of the command buffer for debugging purposes.
+    const char* label = nullptr;
+};
+
 class ICommandBuffer : public ISlangUnknown
 {
     SLANG_COM_INTERFACE(0x58e5d83f, 0xad31, 0x44ea, {0xa4, 0xd1, 0x5e, 0x65, 0x9c, 0xd9, 0xa7, 0x57});
 
 public:
+    virtual SLANG_NO_THROW const CommandBufferDesc& SLANG_MCALL getDesc() = 0;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) = 0;
 };
 
@@ -2443,11 +2715,56 @@ public:
     ) = 0;
 };
 
+struct CommandEncoderDesc
+{
+    static constexpr StructType kStructType = StructType::CommandEncoderDesc;
+    StructType structType = kStructType;
+    const void* next = nullptr;
+
+    /// The name of the command encoder for debugging purposes.
+    const char* label = nullptr;
+};
+
+struct ExecuteCallbackContext
+{
+    /// Native handle for the active backend command context.
+    /// D3D11 supplies D3D11DeviceContext, D3D12 supplies D3D12GraphicsCommandList,
+    /// Vulkan supplies VkCommandBuffer, Metal supplies MTLCommandBuffer, CUDA
+    /// supplies CUstream, and WGPU supplies WGPUCommandEncoder. Backends without
+    /// an active native command context pass Undefined.
+    NativeHandle nativeHandle;
+};
+
+typedef void(SLANG_MCALL* ExecuteCallbackFunc)(
+    const ExecuteCallbackContext* context,
+    void* userObject,
+    const void* userData,
+    Size userDataSize
+);
+typedef void(SLANG_MCALL* ExecuteCallbackObjectFunc)(void* userObject);
+
+struct ExecuteCallbackDesc
+{
+    /// Function to call when the callback command is recorded/executed.
+    ExecuteCallbackFunc callback = nullptr;
+
+    /// Optional object retained until the command buffer is reset or destroyed.
+    void* userObject = nullptr;
+    ExecuteCallbackObjectFunc retainUserObject = nullptr;
+    ExecuteCallbackObjectFunc releaseUserObject = nullptr;
+
+    /// Optional small user-data block copied into the command buffer.
+    const void* userData = nullptr;
+    Size userDataSize = 0;
+};
+
 class ICommandEncoder : public ISlangUnknown
 {
     SLANG_COM_INTERFACE(0x8ee39d55, 0x2b07, 0x4e61, {0x8f, 0x13, 0x1d, 0x6c, 0x01, 0xa9, 0x15, 0x43});
 
 public:
+    virtual SLANG_NO_THROW const CommandEncoderDesc& SLANG_MCALL getDesc() = 0;
+
     virtual SLANG_NO_THROW IRenderPassEncoder* SLANG_MCALL beginRenderPass(const RenderPassDesc& desc) = 0;
     virtual SLANG_NO_THROW IComputePassEncoder* SLANG_MCALL beginComputePass() = 0;
     virtual SLANG_NO_THROW IRayTracingPassEncoder* SLANG_MCALL beginRayTracingPass() = 0;
@@ -2564,6 +2881,12 @@ public:
         const AccelerationStructureQueryDesc* queryDescs
     ) = 0;
 
+    virtual SLANG_NO_THROW void SLANG_MCALL buildMicromap(
+        const MicromapBuildDesc& desc,
+        IMicromap* dst,
+        BufferOffsetPair scratchBuffer
+    ) = 0;
+
     virtual SLANG_NO_THROW void SLANG_MCALL copyAccelerationStructure(
         IAccelerationStructure* dst,
         IAccelerationStructure* src,
@@ -2575,16 +2898,6 @@ public:
         IAccelerationStructure** accelerationStructures,
         uint32_t queryCount,
         const AccelerationStructureQueryDesc* queryDescs
-    ) = 0;
-
-    virtual SLANG_NO_THROW void SLANG_MCALL serializeAccelerationStructure(
-        BufferOffsetPair dst,
-        IAccelerationStructure* src
-    ) = 0;
-
-    virtual SLANG_NO_THROW void SLANG_MCALL deserializeAccelerationStructure(
-        IAccelerationStructure* dst,
-        BufferOffsetPair src
     ) = 0;
 
     virtual SLANG_NO_THROW void SLANG_MCALL executeClusterOperation(const ClusterOperationDesc& desc) = 0;
@@ -2618,7 +2931,21 @@ public:
 
     virtual SLANG_NO_THROW void SLANG_MCALL writeTimestamp(IQueryPool* queryPool, uint32_t queryIndex) = 0;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL finish(ICommandBuffer** outCommandBuffer) = 0;
+    virtual SLANG_NO_THROW void SLANG_MCALL executeCallback(const ExecuteCallbackDesc& desc) = 0;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL finish(
+        const CommandBufferDesc& desc,
+        ICommandBuffer** outCommandBuffer
+    ) = 0;
+
+    inline Result finish(ICommandBuffer** outCommandBuffer) { return finish(CommandBufferDesc{}, outCommandBuffer); }
+
+    inline ComPtr<ICommandBuffer> finish(const CommandBufferDesc& desc)
+    {
+        ComPtr<ICommandBuffer> commandBuffer;
+        SLANG_RETURN_NULL_ON_FAIL(finish(desc, commandBuffer.writeRef()));
+        return commandBuffer;
+    }
 
     inline ComPtr<ICommandBuffer> finish()
     {
@@ -2644,6 +2971,31 @@ public:
 enum class QueueType
 {
     Graphics,
+};
+
+enum class CpuTimestampDomain
+{
+    Unknown,
+    QueryPerformanceCounter,
+    ClockMonotonic,
+    ClockMonotonicRaw,
+    MachAbsoluteTime,
+};
+
+struct TimestampCalibration
+{
+    /// The domain of the CPU timestamp.
+    CpuTimestampDomain cpuDomain = CpuTimestampDomain::Unknown;
+    /// The current CPU timestamp.
+    uint64_t cpuTimestamp = 0;
+    /// The frequency of the CPU timestamp in ticks per second.
+    uint64_t cpuFrequency = 0;
+    /// The current GPU timestamp.
+    uint64_t gpuTimestamp = 0;
+    /// The frequency of the GPU timestamp in ticks per second.
+    uint64_t gpuFrequency = 0;
+    /// The maximum deviation between the CPU and GPU timestamps in nanoseconds.
+    uint64_t maxDeviationNs = 0;
 };
 
 // The NULL CUDA stream is valid (it refers to the default stream), so we
@@ -2674,7 +3026,22 @@ class ICommandQueue : public ISlangUnknown
 public:
     virtual SLANG_NO_THROW QueueType SLANG_MCALL getType() = 0;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(ICommandEncoder** outEncoder) = 0;
+    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(
+        const CommandEncoderDesc& desc,
+        ICommandEncoder** outEncoder
+    ) = 0;
+
+    inline Result createCommandEncoder(ICommandEncoder** outEncoder)
+    {
+        return createCommandEncoder(CommandEncoderDesc{}, outEncoder);
+    }
+
+    inline ComPtr<ICommandEncoder> createCommandEncoder(const CommandEncoderDesc& desc)
+    {
+        ComPtr<ICommandEncoder> encoder;
+        SLANG_RETURN_NULL_ON_FAIL(createCommandEncoder(desc, encoder.writeRef()));
+        return encoder;
+    }
 
     inline ComPtr<ICommandEncoder> createCommandEncoder()
     {
@@ -2702,14 +3069,16 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL waitOnHost() = 0;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) = 0;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL getTimestampCalibration(TimestampCalibration* outCalibration) = 0;
 };
 
 struct SurfaceInfo
 {
     /// The preferred format for the surface.
     Format preferredFormat;
-    /// The supported texture usage for the surface.
-    /// The actual support may be more limited depending on the format.
+    /// The surface-level upper bound for supported texture usage.
+    /// The actual support may be more limited depending on the selected format.
     TextureUsage supportedUsage;
     /// The list of supported formats for the surface.
     const Format* formats;
@@ -2721,7 +3090,8 @@ struct SurfaceConfig
 {
     /// Surface format. If left undefined, the preferred format is used.
     Format format = Format::Undefined;
-    /// Usage of the surface. If left undefined, the supported usage is used.
+    /// Usage of the surface. If left undefined, the backend selects a safe,
+    /// format-compatible subset of the supported usage.
     TextureUsage usage = TextureUsage::None;
     // size_t viewFormatCount;
     // const Format* viewFormats;
@@ -2789,7 +3159,8 @@ struct HeapCachingConfig
 
 struct HeapDesc
 {
-    StructType structType = StructType::HeapDesc;
+    static constexpr StructType kStructType = StructType::HeapDesc;
+    StructType structType = kStructType;
 
     /// Type of memory heap should reside in.
     MemoryType memoryType = MemoryType::DeviceLocal;
@@ -2949,6 +3320,13 @@ struct DeviceLimits
     /// Maximum number of thread groups per dimension in a single dispatch.
     uint32_t maxComputeDispatchThreadGroups[3];
 
+    /// Minimum number of lanes in a wave/subgroup/warp.
+    /// 0 if the size is unknown or not applicable.
+    uint32_t minWaveSize;
+    /// Maximum number of lanes in a wave/subgroup/warp.
+    /// 0 if the size is unknown or not applicable.
+    uint32_t maxWaveSize;
+
     /// Maximum number of viewports per pipeline.
     uint32_t maxViewports;
     /// Maximum viewport dimensions.
@@ -2976,6 +3354,10 @@ struct DeviceInfo
     AdapterLUID adapterLUID;
 
     /// The clock frequency used in timestamp queries.
+    /// This is a legacy/static convenience value for converting differences
+    /// between QueryType::Timestamp results. New code that needs to correlate
+    /// GPU timestamps with a CPU clock should use
+    /// ICommandQueue::getTimestampCalibration().
     uint64_t timestampFrequency = 0;
 
     /// The version of OptiX used by the device (0 if OptiX is not supported).
@@ -2998,6 +3380,8 @@ enum class DebugMessageSource
 class IDebugCallback
 {
 public:
+    /// May be called concurrently from multiple threads. Implementations must provide any required synchronization.
+    /// `message` is valid only for the duration of the call.
     virtual SLANG_NO_THROW void SLANG_MCALL handleMessage(
         DebugMessageType type,
         DebugMessageSource source,
@@ -3064,9 +3448,20 @@ enum class AftermathFlags
 };
 SLANG_RHI_ENUM_CLASS_OPERATORS(AftermathFlags);
 
+enum class PipelineCompilationMode
+{
+    /// Compile pipelines using the default policy immediately and resolve explicitly deferred pipelines sequentially.
+    Serial,
+
+    /// Experimental: defer pipelines using the default policy and resolve deferred pipelines using available task
+    /// parallelism.
+    Parallel,
+};
+
 struct DeviceDesc
 {
-    StructType structType = StructType::DeviceDesc;
+    static constexpr StructType kStructType = StructType::DeviceDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     // The underlying API/Platform of the device.
@@ -3083,8 +3478,8 @@ struct DeviceDesc
     const AdapterLUID* adapterLUID = nullptr;
     // Number of required features.
     uint32_t requiredFeatureCount = 0;
-    // Array of required feature names, whose size is `requiredFeatureCount`.
-    const char** requiredFeatures = nullptr;
+    // Array of required features, whose size is `requiredFeatureCount`.
+    const Feature* requiredFeatures = nullptr;
     // Configurations for Slang compiler.
     SlangDesc slang = {};
 
@@ -3118,6 +3513,25 @@ struct DeviceDesc
 
     /// Enable reporting of shader compilation timings.
     bool enableCompilationReports = false;
+
+    /// Controls the default pipeline compilation policy and resolution of deferred pipelines encountered while
+    /// finishing a command encoder.
+    PipelineCompilationMode pipelineCompilationMode = PipelineCompilationMode::Serial;
+
+    /// Enable launching CUDA kernels from inside graphics command buffers
+    /// (Vulkan only, via VK_NVX_binary_import). On by default. Set to
+    /// false if the application doesn't need vkCmdCuLaunchKernelNVX;
+    /// enabling this extension has been observed to interfere with
+    /// concurrent cuDNN usage on some driver/GPU pairs.
+    bool enableCUDALaunchFromGfx = true;
+
+    /// Enable Vulkan ray tracing extensions (acceleration_structure,
+    /// ray_tracing_pipeline, ray_query, ray_tracing_position_fetch, plus
+    /// NV variants). On by default. Set to false if the application
+    /// doesn't use ray tracing; enabling these extensions has been
+    /// observed to interfere with concurrent cuDNN usage on some
+    /// driver/GPU pairs.
+    bool enableRayTracing = true;
 
     /// Size of a page in staging heap.
     Size stagingHeapPageSize = 16 * 1024 * 1024;
@@ -3472,6 +3886,11 @@ public:
         AccelerationStructureSizes* outSizes
     ) = 0;
 
+    virtual SLANG_NO_THROW Result SLANG_MCALL getMicromapSizes(
+        const MicromapBuildDesc& desc,
+        MicromapSizes* outSizes
+    ) = 0;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getClusterOperationSizes(
         const ClusterOperationParams& params,
         ClusterOperationSizes* outSizes
@@ -3481,6 +3900,8 @@ public:
         const AccelerationStructureDesc& desc,
         IAccelerationStructure** outAccelerationStructure
     ) = 0;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createMicromap(const MicromapDesc& desc, IMicromap** outMicromap) = 0;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createFence(const FenceDesc& desc, IFence** outFence) = 0;
 
@@ -3577,7 +3998,6 @@ public:
 
 /// RAII helper that pushes a device's CUDA context on construction and pops it on destruction.
 /// For non-CUDA devices, this is a no-op.
-/// Usage: SLANG_DEVICE_SCOPE(device);
 class DeviceScope
 {
 public:
@@ -3595,30 +4015,34 @@ private:
     IDevice* m_device;
 };
 
-#define SLANG_DEVICE_SCOPE(device) ::rhi::DeviceScope SLANG_CONCAT(_deviceScope, __LINE__)(device)
+/// Helper macro for creating a DeviceScope with a unique name. Usage: SLANG_RHI_DEVICE_SCOPE(device);
+#define SLANG_RHI_DEVICE_SCOPE(device) ::rhi::DeviceScope SLANG_CONCAT(_deviceScope, __LINE__)(device)
 
-/// \brief Interface for a task pool that supports dependency-based scheduling.
+/// Deprecated alias for SLANG_RHI_DEVICE_SCOPE
+#define SLANG_DEVICE_SCOPE(device) SLANG_RHI_DEVICE_SCOPE(device)
+
+/// \brief Interface for asynchronous task execution.
 ///
 /// Tasks are submitted with `submitTask()`, which returns an opaque `TaskHandle`.
 /// Each task executes a user-provided function with an associated payload.
-/// Tasks may declare dependencies on other tasks, forming a directed acyclic graph (DAG).
-/// A task will not execute until all of its dependencies have completed.
 ///
 /// **Ownership model:**
 /// `submitTask()` returns a `TaskHandle` that the caller owns. The caller must eventually
-/// call `releaseTask()` to release this handle. The task pool also holds an internal
-/// reference while the task is pending or executing, so the task remains alive until
-/// both the pool and the caller have released their references.
+/// release it by calling either `releaseTask()` or `waitAndReleaseTask()`. Releasing a
+/// handle does not cancel or otherwise affect task execution.
 ///
 /// **Payload lifetime:**
-/// If a `payloadDeleter` is provided, it is called when the last reference to the task
-/// is released (i.e. after both the pool and the caller have released). The payload
-/// remains valid and accessible via `getTaskPayload()` until that point.
+/// If a `payloadDeleter` is provided, it is called after the task function returns and
+/// before the task is considered complete. The payload must remain valid until then.
 ///
-/// **Dependency rules:**
-/// - Dependencies must not form cycles, doing so might result in a deadlock.
-/// - A dependency task handle must still be valid (not yet released) when passed to `submitTask()`.
-/// - Once a task is submitted, its dependencies may be released immediately by the caller.
+/// **Thread safety:**
+/// - Methods may be called concurrently unless documented otherwise.
+/// - Task and task-group handles are specific to the pool that created them.
+/// - A handle must remain valid while any thread is using it. The caller must synchronize
+///   operations that consume the same handle.
+/// - The task pool must remain alive until all task and task-group handles it created are released.
+/// - Task functions may run on a pool worker, a thread waiting on the pool, or the submitting
+///   thread. Task functions and payload deleters must be thread-safe and must not throw exceptions.
 ///
 class ITaskPool : public ISlangUnknown
 {
@@ -3626,67 +4050,69 @@ class ITaskPool : public ISlangUnknown
 
 public:
     typedef void* TaskHandle;
+    typedef void* TaskGroupHandle;
 
     /// \brief Submit a new task for execution.
     ///
-    /// Submits a task that will call `func(payload)` once all dependencies in `deps` have
-    /// completed. The returned `TaskHandle` must eventually be released with `releaseTask()`.
-    ///
-    /// If `depsCount` is 0, the task is immediately eligible for execution.
-    /// If any dependency is already complete at the time of submission, it is handled correctly.
+    /// Submits a task that will call `func(payload)`. The returned `TaskHandle` must eventually
+    /// be released with either `releaseTask()` or `waitAndReleaseTask()`.
     ///
     /// \param func Function to execute. Must not be null.
     /// \param payload Opaque data passed to `func`. May be null.
-    /// \param payloadDeleter Optional deleter called with `payload` when the task is destroyed. May be null if no cleanup is needed.
-    /// \param deps Array of `TaskHandle`s that must complete before this task runs. May be null if `depsCount` is 0.
-    /// \param depsCount Number of entries in `deps`.
-    /// \return A handle to the submitted task. The caller must release this with `releaseTask()`.
+    /// \param payloadDeleter Optional deleter called with `payload` after `func` returns. May be null if no cleanup is needed.
+    /// \param group Optional task group handle. If non-null, the task is associated with the group.
+    /// \return A handle to the submitted task.
     virtual SLANG_NO_THROW TaskHandle SLANG_MCALL submitTask(
         void (*func)(void*),
         void* payload,
         void (*payloadDeleter)(void*),
-        TaskHandle* deps,
-        size_t depsCount
+        TaskGroupHandle group = nullptr
     ) = 0;
-
-    /// \brief Get the payload associated with a task.
-    ///
-    /// Returns the `payload` pointer that was passed to `submitTask()`. The payload remains
-    /// valid until the task is fully released (i.e. after the caller calls `releaseTask()`
-    /// and the pool has finished executing the task).
-    ///
-    /// \param task Task handle. Must not be null.
-    /// \return The payload pointer.
-    virtual SLANG_NO_THROW void* SLANG_MCALL getTaskPayload(TaskHandle task) = 0;
 
     /// \brief Release the caller's reference to a task.
     ///
-    /// Releases the caller's ownership of the task handle. If this is the last reference
-    /// (i.e. the task has already completed and the pool has released its internal reference),
-    /// the task is destroyed.
-    ///
-    /// A task may be released before it has finished executing, the pool's internal reference
-    /// keeps it alive until completion.
+    /// Releases the caller's ownership of the task handle without waiting. The task may still
+    /// be pending or executing and will continue to completion.
     ///
     /// \param task Task handle to release. Must not be null. Must not be used after this call.
     virtual SLANG_NO_THROW void SLANG_MCALL releaseTask(TaskHandle task) = 0;
 
-    /// \brief Block the calling thread until a task has finished executing.
+    /// \brief Wait for a task to finish and release its handle.
     ///
-    /// \param task Task handle to wait on. Must not be null.
-    virtual SLANG_NO_THROW void SLANG_MCALL waitTask(TaskHandle task) = 0;
+    /// When called outside a task callback, the calling thread may execute pending tasks
+    /// (work-stealing). Calling this method from a task callback is only safe when the waited-on
+    /// task can make progress without the calling thread executing additional work.
+    ///
+    /// This call consumes `task`; the handle must not be used afterward.
+    ///
+    /// \param task Task handle to wait on and release. Must not be null.
+    virtual SLANG_NO_THROW void SLANG_MCALL waitAndReleaseTask(TaskHandle task) = 0;
 
-    /// \brief Check whether a task has finished executing (non-blocking).
+    /// \brief Create a new task group for tracking a set of tasks.
     ///
-    /// \param task Task handle to check. Must not be null.
-    /// \return True if the task has completed, false if it is still pending or executing.
-    virtual SLANG_NO_THROW bool SLANG_MCALL isTaskDone(TaskHandle task) = 0;
+    /// A task group tracks a dynamically growing set of tasks. Tasks are associated with a
+    /// group by passing the group handle to `submitTask()`.
+    /// The group may only be used with the task pool that created it.
+    ///
+    /// \return An opaque handle to the task group.
+    virtual SLANG_NO_THROW TaskGroupHandle SLANG_MCALL createTaskGroup() = 0;
 
-    /// \brief Block the calling thread until all submitted tasks have finished.
+    /// \brief Wait for all tasks in a group to complete and release the group.
     ///
-    /// Waits for every task that has been submitted to this pool (and not yet completed)
-    /// to finish executing. Does not release any task handles.
-    virtual SLANG_NO_THROW void SLANG_MCALL waitAll() = 0;
+    /// While waiting, the calling thread may execute pending tasks (work-stealing).
+    /// When called outside a task callback, the calling thread may execute any ready task in
+    /// the pool. When called from a task callback, it executes only ready tasks from `group`.
+    /// Subject to the restrictions below, this makes it safe to call from a task callback.
+    /// A task must not wait on a group that contains the task itself. When called
+    /// from a task callback, tasks in the group must not depend on work outside
+    /// the group that cannot otherwise make progress.
+    /// Must not be called while other threads are still submitting tasks to the group
+    /// outside of task callbacks.
+    /// This call consumes `group`; the handle must not be used afterward. Only one thread may
+    /// wait on a group.
+    ///
+    /// \param group Task group handle to wait on and release. Must not be null.
+    virtual SLANG_NO_THROW void SLANG_MCALL waitAndReleaseTaskGroup(TaskGroupHandle group) = 0;
 };
 
 class IPersistentCache : public ISlangUnknown
@@ -3694,7 +4120,15 @@ class IPersistentCache : public ISlangUnknown
     SLANG_COM_INTERFACE(0x68981742, 0x7fd6, 0x4700, {0x8a, 0x71, 0xe8, 0xea, 0x42, 0x91, 0x3b, 0x28});
 
 public:
+    /// Writes an entry to the cache.
+    /// Implementations must support concurrent calls to writeCache() and queryCache(), including when the cache is
+    /// shared by multiple devices or used for both shaders and pipelines.
     virtual SLANG_NO_THROW Result SLANG_MCALL writeCache(ISlangBlob* key, ISlangBlob* data) = 0;
+
+    /// Queries an entry from the cache.
+    /// Implementations must support concurrent calls to writeCache() and queryCache(), including when the cache is
+    /// shared by multiple devices or used for both shaders and pipelines.
+    /// A returned blob must remain valid independently of subsequent cache calls.
     virtual SLANG_NO_THROW Result SLANG_MCALL queryCache(ISlangBlob* key, ISlangBlob** outData) = 0;
 };
 
@@ -3803,7 +4237,8 @@ public:
 // Extended descs.
 struct D3D12ExperimentalFeaturesDesc
 {
-    StructType structType = StructType::D3D12ExperimentalFeaturesDesc;
+    static constexpr StructType kStructType = StructType::D3D12ExperimentalFeaturesDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     uint32_t featureCount = 0;
@@ -3814,26 +4249,40 @@ struct D3D12ExperimentalFeaturesDesc
 
 struct D3D12DeviceExtendedDesc
 {
-    StructType structType = StructType::D3D12DeviceExtendedDesc;
+    static constexpr StructType kStructType = StructType::D3D12DeviceExtendedDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     const char* rootParameterShaderAttributeName = nullptr;
     bool debugBreakOnD3D12Error = false;
+    /// Limits the maximum shader model using D3D_SHADER_MODEL encoding (for example, 0x6a for SM 6.10).
+    /// A value of 0 uses automatic detection.
     uint32_t highestShaderModel = 0;
 };
 
 struct VulkanDeviceExtendedDesc
 {
-    StructType structType = StructType::VulkanDeviceExtendedDesc;
+    static constexpr StructType kStructType = StructType::VulkanDeviceExtendedDesc;
+    StructType structType = kStructType;
     const void* next = nullptr;
 
     bool enableDebugPrintf = false;
+
+    uint32_t instanceExtensionCount = 0;
+    const char* const* instanceExtensions = nullptr;
+    uint32_t deviceExtensionCount = 0;
+    const char* const* deviceExtensions = nullptr;
 };
 
 } // namespace rhi
 
 /// Get the global interface to the RHI.
 extern "C" SLANG_RHI_API rhi::IRHI* SLANG_STDCALL rhiGetInstance();
+
+/// Destroy the global RHI instance and release all owned resources.
+/// Fails if any devices are currently alive.
+/// After calling this, rhiGetInstance() will create a new instance on next call.
+extern "C" SLANG_RHI_API SlangResult SLANG_STDCALL rhiDestroyInstance();
 
 // Global public functions
 
@@ -3843,6 +4292,14 @@ namespace rhi {
 inline IRHI* getRHI()
 {
     return ::rhiGetInstance();
+}
+
+/// Destroy the global RHI instance and release all owned resources.
+/// Fails if any devices are currently alive.
+/// After calling this, getRHI() will create a new instance on next call.
+inline Result destroyRHI()
+{
+    return rhiDestroyInstance();
 }
 
 inline const FormatInfo& getFormatInfo(Format format)

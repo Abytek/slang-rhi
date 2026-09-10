@@ -35,15 +35,24 @@ Result SamplerImpl::getNativeHandle(NativeHandle* outHandle)
 
 Result SamplerImpl::getDescriptorHandle(DescriptorHandle* outHandle)
 {
+    if (m_descriptorHandle)
+    {
+        *outHandle = m_descriptorHandle;
+        return SLANG_OK;
+    }
+
     DeviceImpl* device = getDevice<DeviceImpl>();
+
     if (!device->m_bindlessDescriptorSet)
     {
         return SLANG_E_NOT_AVAILABLE;
     }
+
     if (!m_descriptorHandle)
     {
-        SLANG_RETURN_FALSE_ON_FAIL(device->m_bindlessDescriptorSet->allocSamplerHandle(this, &m_descriptorHandle));
+        SLANG_RETURN_ON_FAIL(device->m_bindlessDescriptorSet->allocSamplerHandle(this, &m_descriptorHandle));
     }
+
     *outHandle = m_descriptorHandle;
     return SLANG_OK;
 }
@@ -123,7 +132,7 @@ Result DeviceImpl::createSampler(const SamplerDesc& desc, ISampler** outSampler)
     samplerInfo.pNext = &reductionInfo;
 
     VkSampler sampler;
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkCreateSampler(m_device, &samplerInfo, nullptr, &sampler));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkCreateSampler(m_device, &samplerInfo, nullptr, &sampler), this);
 
     _labelObject((uint64_t)sampler, VK_OBJECT_TYPE_SAMPLER, desc.label);
 

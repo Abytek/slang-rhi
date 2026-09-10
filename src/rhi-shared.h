@@ -18,9 +18,11 @@
 #include "shader.h"
 #include "pipeline.h"
 
+#include <cstddef>
 #include <map>
-#include <set>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -31,12 +33,25 @@ class Device;
 class CommandEncoder;
 class CommandList;
 
-/// Common header for Desc struct types.
-struct DescStructHeader
+/// Common prefix for structures linked through a `next` chain.
+struct ChainedStructHeader
 {
     StructType type;
-    DescStructHeader* next;
+    const void* next;
 };
+
+/// Finds the first structure of type `T` in a `next` chain, or returns null.
+template<typename T>
+const T* findStructInChain(const void* chain)
+{
+    for (auto* header = static_cast<const ChainedStructHeader*>(chain); header;
+         header = static_cast<const ChainedStructHeader*>(header->next))
+    {
+        if (header->type == T::kStructType)
+            return reinterpret_cast<const T*>(header);
+    }
+    return nullptr;
+}
 
 class Fence : public IFence, public DeviceChild
 {
@@ -50,7 +65,7 @@ public:
 protected:
     FenceDesc m_desc;
     StructHolder m_descHolder;
-    NativeHandle sharedHandle = {};
+    NativeHandle m_sharedHandle = {};
 };
 
 class Resource : public DeviceChild
@@ -78,7 +93,6 @@ public:
 
     // IBuffer interface
     virtual SLANG_NO_THROW BufferDesc& SLANG_MCALL getDesc() override { return m_desc; }
-    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getSharedHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(
         DescriptorHandleAccess access,
@@ -86,6 +100,9 @@ public:
         BufferRange range,
         DescriptorHandle* outHandle
     ) override;
+
+    // IResource interface
+    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
 
 public:
     BufferDesc m_desc;
@@ -138,7 +155,6 @@ public:
 
     // ITexture interface
     virtual SLANG_NO_THROW TextureDesc& SLANG_MCALL getDesc() override { return m_desc; };
-    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getSharedHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createView(
         const TextureViewDesc& desc,
@@ -153,6 +169,9 @@ public:
     {
         return getSubresourceRegionLayout(mip, {0, 0, 0}, Extent3D::kWholeTexture, rowAlignment, outLayout);
     }
+
+    // IResource interface
+    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
 
 public:
     TextureDesc m_desc;
@@ -171,7 +190,6 @@ public:
     TextureView(Device* device, const TextureViewDesc& desc);
 
     // ITextureView interface
-    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW const TextureViewDesc& SLANG_MCALL getDesc() override { return m_desc; }
     virtual SLANG_NO_THROW Result getDescriptorHandle(
         DescriptorHandleAccess access,
@@ -180,6 +198,9 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL getCombinedTextureSamplerDescriptorHandle(
         DescriptorHandle* outHandle
     ) override;
+
+    // IResource interface
+    virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
 
 public:
     TextureViewDesc m_desc;
@@ -197,7 +218,7 @@ public:
     Sampler(Device* device, const SamplerDesc& desc);
 
     // ISampler interface
-    virtual SLANG_NO_THROW const SamplerDesc& SLANG_MCALL getDesc() override;
+    virtual SLANG_NO_THROW const SamplerDesc& SLANG_MCALL getDesc() override { return m_desc; }
     virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(DescriptorHandle* outHandle) override;
 
     // IResource interface
@@ -218,11 +239,29 @@ public:
     AccelerationStructure(Device* device, const AccelerationStructureDesc& desc);
 
     // IAccelerationStructure interface
+    virtual SLANG_NO_THROW const AccelerationStructureDesc& SLANG_MCALL getDesc() override { return m_desc; }
     virtual SLANG_NO_THROW AccelerationStructureHandle SLANG_MCALL getHandle() override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(DescriptorHandle* outHandle) override;
 
 public:
     AccelerationStructureDesc m_desc;
+    StructHolder m_descHolder;
+};
+
+class Micromap : public IMicromap, public Resource
+{
+public:
+    SLANG_COM_OBJECT_IUNKNOWN_ALL
+    IMicromap* getInterface(const Guid& guid);
+
+public:
+    Micromap(Device* device, const MicromapDesc& desc);
+
+    // IMicromap interface
+    virtual SLANG_NO_THROW const MicromapDesc& SLANG_MCALL getDesc() override { return m_desc; }
+
+public:
+    MicromapDesc m_desc;
     StructHolder m_descHolder;
 };
 
@@ -243,11 +282,51 @@ public:
     QueryPool(Device* device, const QueryPoolDesc& desc);
 
     virtual SLANG_NO_THROW const QueryPoolDesc& SLANG_MCALL getDesc() override { return m_desc; }
-    virtual SLANG_NO_THROW Result SLANG_MCALL reset() override { return SLANG_OK; }
+    virtual SLANG_NO_THROW Result SLANG_MCALL getResultState(
+        uint32_t queryIndex,
+        uint32_t count,
+        QueryResultState* outState
+    ) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL reset() override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL reset(uint32_t queryIndex, uint32_t count) override;
+
+    struct QueryRangeInfo
+    {
+        QueryResultState state = QueryResultState::Reset;
+        uint64_t submissionID = 0;
+    };
+
+    bool isValidQueryRange(uint32_t queryIndex, uint32_t count) const;
+    void markQueryRangeSubmitted(uint32_t queryIndex, uint32_t count, uint64_t submissionID);
+    void markQueryRangeResolved(uint32_t queryIndex, uint32_t count, uint64_t completedSubmissionID);
+    QueryRangeInfo getQueryRangeInfo(uint32_t queryIndex, uint32_t count) const;
 
 public:
+    struct QuerySlotState
+    {
+        static constexpr uint64_t kStateShift = 62;
+        static constexpr uint64_t kStateMask = uint64_t(3) << kStateShift;
+        static constexpr uint64_t kSubmissionIDMask = (uint64_t(1) << kStateShift) - 1;
+
+        uint64_t packedState = 0;
+
+        void set(QueryResultState state, uint64_t submissionID)
+        {
+            SLANG_RHI_ASSERT((submissionID & ~kSubmissionIDMask) == 0);
+            packedState = (uint64_t(state) << kStateShift) | (submissionID & kSubmissionIDMask);
+        }
+
+        QueryResultState getState() const { return QueryResultState((packedState & kStateMask) >> kStateShift); }
+
+        uint64_t getSubmissionID() const { return packedState & kSubmissionIDMask; }
+    };
+
+    static_assert(sizeof(QuerySlotState) == 8, "QuerySlotState should remain compact.");
+
     QueryPoolDesc m_desc;
     StructHolder m_descHolder;
+    std::vector<QuerySlotState> m_querySlotStates;
+    mutable std::mutex m_queryStateMutex;
 };
 
 class ShaderTable : public IShaderTable, public DeviceChild
@@ -296,6 +375,7 @@ public:
 public:
     void setInfo(const SurfaceInfo& info);
     void setConfig(const SurfaceConfig& config);
+    Result validateConfig(const SurfaceConfig& config) const;
 
     SurfaceInfo m_info;
     StructHolder m_infoHolder;
@@ -304,20 +384,20 @@ public:
     bool m_configured = false;
 };
 
-struct DeviceAdapter
+inline Device* getDiagnosticDevice(Device* device)
 {
-    Device* device;
-    DeviceAdapter(Device* device)
-        : device(device)
-    {
-    }
-    DeviceAdapter(DeviceChild* deviceChild)
-        : device(deviceChild && deviceChild->getDevice() ? deviceChild->getDevice() : nullptr)
-    {
-    }
-    explicit operator bool() const { return device != nullptr; }
-    Device* operator->() const { return device; }
-};
+    return device;
+}
+
+inline Device* getDiagnosticDevice(std::nullptr_t)
+{
+    return nullptr;
+}
+
+inline Device* getDiagnosticDevice(DeviceChild* deviceChild)
+{
+    return deviceChild ? deviceChild->getDevice() : nullptr;
+}
 
 bool isDepthFormat(Format format);
 bool isStencilFormat(Format format);
@@ -331,5 +411,7 @@ inline uint32_t heightInBlocks(const FormatInfo& formatInfo, uint32_t size)
 {
     return formatInfo.isCompressed ? (size + formatInfo.blockHeight - 1) / formatInfo.blockHeight : size;
 }
+
+bool isDebugLayersEnabled();
 
 } // namespace rhi

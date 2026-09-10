@@ -2,7 +2,7 @@
 
 #include "d3d12-base.h"
 #include "d3d12-shader-object.h"
-#include "d3d12-constant-buffer-pool.h"
+#include "../transient-buffer-heap.h"
 
 #include "core/ring-queue.h"
 
@@ -59,10 +59,14 @@ public:
     void executeDeferredDeletes();
 
     // ICommandQueue implementation
-    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(ICommandEncoder** outEncoder) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(
+        const CommandEncoderDesc& desc,
+        ICommandEncoder** outEncoder
+    ) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL submit(const SubmitDesc& desc) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL waitOnHost() override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL getTimestampCalibration(TimestampCalibration* outCalibration) override;
 };
 
 class CommandEncoderImpl : public CommandEncoder
@@ -71,7 +75,7 @@ public:
     CommandQueueImpl* m_queue;
     RefPtr<CommandBufferImpl> m_commandBuffer;
 
-    CommandEncoderImpl(Device* device, CommandQueueImpl* queue);
+    CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc);
     ~CommandEncoderImpl();
 
     Result init();
@@ -79,7 +83,10 @@ public:
     virtual Result getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData) override;
 
     // ICommandEncoder implementation
-    virtual SLANG_NO_THROW Result SLANG_MCALL finish(ICommandBuffer** outCommandBuffer) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL finish(
+        const CommandBufferDesc& desc,
+        ICommandBuffer** outCommandBuffer
+    ) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
 };
 
@@ -91,7 +98,7 @@ public:
     ComPtr<ID3D12GraphicsCommandList> m_d3dCommandList;
     GPUDescriptorArena m_cbvSrvUavArena;
     GPUDescriptorArena m_samplerArena;
-    ConstantBufferPool m_constantBufferPool;
+    TransientBufferArena m_constantBufferArena;
     BindingCache m_bindingCache;
     uint64_t m_submissionID = 0;
 

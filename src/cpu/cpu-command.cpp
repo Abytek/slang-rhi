@@ -5,7 +5,7 @@
 #include "../command-list.h"
 #include "../strings.h"
 
-#include <chrono>
+#include "core/platform.h"
 
 namespace rhi::cpu {
 
@@ -13,12 +13,14 @@ class CommandExecutor
 {
 public:
     DeviceImpl* m_device;
+    uint64_t m_submissionID;
     RefPtr<ComputePipelineImpl> m_computePipeline;
     BindingDataImpl* m_bindingData = nullptr;
     bool m_computeStateValid = false;
 
-    CommandExecutor(DeviceImpl* device)
+    CommandExecutor(DeviceImpl* device, uint64_t submissionID)
         : m_device(device)
+        , m_submissionID(submissionID)
     {
     }
 
@@ -51,10 +53,9 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
-    void cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd);
-    void cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
     void cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd);
     void cmdSetBufferState(const commands::SetBufferState& cmd);
@@ -88,12 +89,10 @@ Result CommandExecutor::execute(CommandBufferImpl* commandBuffer)
         command = command->next;
     }
 
-#undef NOT_IMPLEMENTED
-
     return SLANG_OK;
 }
 
-#define NOT_SUPPORTED(x) m_device->printWarning(x " command is not supported!")
+#define NOT_SUPPORTED(interface, method) m_device->printWarning(#interface "::" #method " is not supported!")
 
 void CommandExecutor::cmdCopyBuffer(const commands::CopyBuffer& cmd)
 {
@@ -105,13 +104,13 @@ void CommandExecutor::cmdCopyBuffer(const commands::CopyBuffer& cmd)
 void CommandExecutor::cmdCopyTexture(const commands::CopyTexture& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_copyTexture);
+    NOT_SUPPORTED(ICommandEncoder, copyTexture);
 }
 
 void CommandExecutor::cmdCopyTextureToBuffer(const commands::CopyTextureToBuffer& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_copyTextureToBuffer);
+    NOT_SUPPORTED(ICommandEncoder, copyTextureToBuffer);
 }
 
 void CommandExecutor::cmdClearBuffer(const commands::ClearBuffer& cmd)
@@ -123,25 +122,25 @@ void CommandExecutor::cmdClearBuffer(const commands::ClearBuffer& cmd)
 void CommandExecutor::cmdClearTextureDepthStencil(const commands::ClearTextureDepthStencil& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_clearTextureDepthStencil);
+    NOT_SUPPORTED(ICommandEncoder, clearTextureDepthStencil);
 }
 
 void CommandExecutor::cmdClearTextureFloat(const commands::ClearTextureFloat& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_clearTextureFloat);
+    NOT_SUPPORTED(ICommandEncoder, clearTextureFloat);
 }
 
 void CommandExecutor::cmdClearTextureUint(const commands::ClearTextureUint& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_clearTextureUint);
+    NOT_SUPPORTED(ICommandEncoder, clearTextureUint);
 }
 
 void CommandExecutor::cmdUploadTextureData(const commands::UploadTextureData& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_uploadTextureData);
+    NOT_SUPPORTED(ICommandEncoder, uploadTextureData);
 }
 
 void CommandExecutor::cmdResolveQuery(const commands::ResolveQuery& cmd)
@@ -154,7 +153,7 @@ void CommandExecutor::cmdResolveQuery(const commands::ResolveQuery& cmd)
 void CommandExecutor::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_beginRenderPass);
+    NOT_SUPPORTED(ICommandEncoder, beginRenderPass);
 }
 
 void CommandExecutor::cmdEndRenderPass(const commands::EndRenderPass& cmd)
@@ -170,31 +169,31 @@ void CommandExecutor::cmdSetRenderState(const commands::SetRenderState& cmd)
 void CommandExecutor::cmdDraw(const commands::Draw& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_draw);
+    NOT_SUPPORTED(IRenderPassEncoder, draw);
 }
 
 void CommandExecutor::cmdDrawIndexed(const commands::DrawIndexed& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndexed);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndexed);
 }
 
 void CommandExecutor::cmdDrawIndirect(const commands::DrawIndirect& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndirect);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndirect);
 }
 
 void CommandExecutor::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndexedIndirect);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndexedIndirect);
 }
 
 void CommandExecutor::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawMeshTasks);
+    NOT_SUPPORTED(IRenderPassEncoder, drawMeshTasks);
 }
 
 void CommandExecutor::cmdBeginComputePass(const commands::BeginComputePass& cmd)
@@ -233,13 +232,13 @@ void CommandExecutor::cmdDispatchCompute(const commands::DispatchCompute& cmd)
 void CommandExecutor::cmdDispatchComputeIndirect(const commands::DispatchComputeIndirect& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_ComputePassEncoder_dispatchComputeIndirect);
+    NOT_SUPPORTED(IComputePassEncoder, dispatchComputeIndirect);
 }
 
 void CommandExecutor::cmdBeginRayTracingPass(const commands::BeginRayTracingPass& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_beginRayTracingPass);
+    NOT_SUPPORTED(ICommandEncoder, beginRayTracingPass);
 }
 
 void CommandExecutor::cmdEndRayTracingPass(const commands::EndRayTracingPass& cmd)
@@ -255,49 +254,43 @@ void CommandExecutor::cmdSetRayTracingState(const commands::SetRayTracingState& 
 void CommandExecutor::cmdDispatchRays(const commands::DispatchRays& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RayTracingPassEncoder_dispatchRays);
+    NOT_SUPPORTED(IRayTracingPassEncoder, dispatchRays);
 }
 
 void CommandExecutor::cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_buildAccelerationStructure);
+    NOT_SUPPORTED(ICommandEncoder, buildAccelerationStructure);
+}
+
+void CommandExecutor::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(ICommandEncoder, buildMicromap);
 }
 
 void CommandExecutor::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_copyAccelerationStructure);
+    NOT_SUPPORTED(ICommandEncoder, copyAccelerationStructure);
 }
 
 void CommandExecutor::cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_queryAccelerationStructureProperties);
-}
-
-void CommandExecutor::cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_serializeAccelerationStructure);
-}
-
-void CommandExecutor::cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_deserializeAccelerationStructure);
+    NOT_SUPPORTED(ICommandEncoder, queryAccelerationStructureProperties);
 }
 
 void CommandExecutor::cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_executeClusterOperation);
+    NOT_SUPPORTED(ICommandEncoder, executeClusterOperation);
 }
 
 void CommandExecutor::cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd)
 {
     SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_CommandEncoder_convertCooperativeVectorMatrix);
+    NOT_SUPPORTED(ICommandEncoder, convertCooperativeVectorMatrix);
 }
 
 void CommandExecutor::cmdSetBufferState(const commands::SetBufferState& cmd)
@@ -333,12 +326,14 @@ void CommandExecutor::cmdInsertDebugMarker(const commands::InsertDebugMarker& cm
 void CommandExecutor::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 {
     auto queryPool = checked_cast<QueryPoolImpl*>(cmd.queryPool);
-    queryPool->m_queries[cmd.queryIndex] = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    queryPool->m_queries[cmd.queryIndex] = getCpuTimestamp();
+    queryPool->markQueryRangeSubmitted(cmd.queryIndex, 1, m_submissionID);
+    queryPool->markQueryRangeResolved(cmd.queryIndex, 1, m_submissionID);
 }
 
 void CommandExecutor::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 {
-    cmd.callback(cmd.userData);
+    invokeExecuteCallback(cmd, {});
 }
 
 // CommandQueueImpl
@@ -348,9 +343,9 @@ CommandQueueImpl::CommandQueueImpl(Device* device, QueueType type)
 {
 }
 
-Result CommandQueueImpl::createCommandEncoder(ICommandEncoder** outEncoder)
+Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
 {
-    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device);
+    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, desc);
     SLANG_RETURN_ON_FAIL(encoder->init());
     returnComPtr(outEncoder, encoder);
     return SLANG_OK;
@@ -370,10 +365,12 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
         }
     }
 
+    ++m_lastSubmittedID;
+
     // Execute command buffers.
     for (uint32_t i = 0; i < desc.commandBufferCount; i++)
     {
-        CommandExecutor executor(getDevice<DeviceImpl>());
+        CommandExecutor executor(getDevice<DeviceImpl>(), m_lastSubmittedID);
         SLANG_RETURN_ON_FAIL(executor.execute(checked_cast<CommandBufferImpl*>(desc.commandBuffers[i])));
     }
 
@@ -397,10 +394,30 @@ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
     return SLANG_E_NOT_AVAILABLE;
 }
 
+Result CommandQueueImpl::getTimestampCalibration(TimestampCalibration* outCalibration)
+{
+    if (!outCalibration)
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    const uint64_t cpuFrequency = getCpuTimestampFrequency();
+    const uint64_t cpuTimestamp = getCpuTimestamp();
+
+    outCalibration->cpuDomain = getCpuTimestampDomain();
+    outCalibration->cpuTimestamp = cpuTimestamp;
+    outCalibration->cpuFrequency = cpuFrequency;
+    outCalibration->gpuTimestamp = cpuTimestamp;
+    outCalibration->gpuFrequency = cpuFrequency;
+    outCalibration->maxDeviationNs = 0;
+
+    return SLANG_OK;
+}
+
 // CommandEncoderImpl
 
-CommandEncoderImpl::CommandEncoderImpl(Device* device)
-    : CommandEncoder(device)
+CommandEncoderImpl::CommandEncoderImpl(Device* device, const CommandEncoderDesc& desc)
+    : CommandEncoder(device, desc)
 {
 }
 
@@ -427,8 +444,9 @@ Result CommandEncoderImpl::init()
     return SLANG_OK;
 }
 
-Result CommandEncoderImpl::finish(ICommandBuffer** outCommandBuffer)
+Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
 {
+    m_commandBuffer->setDesc(desc);
     SLANG_RETURN_ON_FAIL(resolvePipelines(m_device));
     returnComPtr(outCommandBuffer, m_commandBuffer);
     m_commandBuffer = nullptr;

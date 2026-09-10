@@ -44,6 +44,74 @@ GPU_TEST_CASE("cmd-upload-texture-simple", D3D12 | Vulkan | Metal | CUDA | WGPU)
     );
 }
 
+GPU_TEST_CASE("cmd-upload-texture-subresource-offset-alignment", D3D12 | Vulkan | Metal | CUDA | WGPU)
+{
+    TextureTestOptions options(device);
+    // The generated 33x17 texture has mip sizes that are not all multiples of
+    // D3D12's 512-byte placed-footprint alignment. Uploading all mips together
+    // verifies that each staged subresource starts at a valid backend offset.
+    options.addVariants(
+        TextureType::Texture2D,
+        std::vector<Format>{Format::RGBA8Unorm},
+        TTArray::Off,
+        TTMip::On,
+        TextureInitMode::None,
+        TTFmtDepth::Off,
+        TTPowerOf2::Off
+    );
+
+    runTextureTest(
+        options,
+        [](TextureTestContext* c)
+        {
+            TextureData& data = c->getTextureData();
+            data.initData(TextureInitMode::Random);
+
+            auto queue = c->getDevice()->getQueue(QueueType::Graphics);
+            auto commandEncoder = queue->createCommandEncoder();
+            commandEncoder->uploadTextureData(
+                c->getTexture(),
+                {0, 1, 0, data.desc.mipCount},
+                {0, 0, 0},
+                Extent3D::kWholeTexture,
+                data.subresourceData.data(),
+                data.subresourceData.size()
+            );
+            queue->submit(commandEncoder->finish());
+
+            data.checkEqual(c->getTexture());
+        }
+    );
+}
+
+GPU_TEST_CASE("cmd-upload-texture-compressed-npot-mips", Metal | Vulkan | WGPU)
+{
+    TextureTestOptions options(device);
+    options.addVariants(
+        TextureType::Texture2D,
+        std::vector<Format>{Format::ASTC6x6Unorm, Format::ASTC8x8Unorm},
+        TTArray::Both,
+        TTMip::On,
+        TextureInitMode::None,
+        TTFmtDepth::Off,
+        TTPowerOf2::Off
+    );
+
+    runTextureTest(
+        options,
+        [](TextureTestContext* c)
+        {
+            TextureData& data = c->getTextureData();
+            data.initData(TextureInitMode::Random);
+
+            ComPtr<ITexture> texture;
+            REQUIRE_CALL(data.createTexture(texture.writeRef()));
+
+            data.checkEqual(texture);
+        }
+    );
+}
+
 GPU_TEST_CASE("cmd-upload-texture-single-layer", D3D12 | Vulkan | Metal | CUDA | WGPU)
 {
     TextureTestOptions options(device);
@@ -230,8 +298,8 @@ GPU_TEST_CASE("cmd-upload-texture-offset", D3D12 | Vulkan | Metal | CUDA | WGPU)
             Extent3D size = currentData.desc.size;
 
             Offset3D offset = {size.width / 2, size.height / 2, size.depth / 2};
-            offset.x = math::calcAligned2(offset.x, currentData.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, currentData.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, currentData.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, currentData.formatInfo.blockHeight);
 
             TextureDesc newDesc = currentData.desc;
             newDesc.size.width = size.width - offset.x;
@@ -285,12 +353,12 @@ GPU_TEST_CASE("cmd-upload-texture-sizeoffset", D3D12 | Vulkan | Metal | CUDA | W
             Extent3D size = currentData.desc.size;
 
             Offset3D offset = {size.width / 4, size.height / 4, size.depth / 4};
-            offset.x = math::calcAligned2(offset.x, currentData.formatInfo.blockWidth);
-            offset.y = math::calcAligned2(offset.y, currentData.formatInfo.blockHeight);
+            offset.x = math::calcAlignedDown(offset.x, currentData.formatInfo.blockWidth);
+            offset.y = math::calcAlignedDown(offset.y, currentData.formatInfo.blockHeight);
 
             Extent3D extent = {max(size.width / 4, 1u), max(size.height / 4, 1u), max(size.depth / 4, 1u)};
-            extent.width = math::calcAligned2(extent.width, currentData.formatInfo.blockWidth);
-            extent.height = math::calcAligned2(extent.height, currentData.formatInfo.blockHeight);
+            extent.width = math::calcAligned(extent.width, currentData.formatInfo.blockWidth);
+            extent.height = math::calcAligned(extent.height, currentData.formatInfo.blockHeight);
 
             TextureDesc newDesc = currentData.desc;
             newDesc.size.width = extent.width;
